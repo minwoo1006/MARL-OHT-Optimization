@@ -40,7 +40,7 @@
 
 ### **1주차: 설계 및 환경 구축 (Foundation Phase)**
 - **목표:** 에이전트가 움직일 수 있는 '규격화된 운동장' 완성
-- **팀원 1 (Architect):** `NetworkX` 기반 레일 그래프 설계 및 `oht_env.py` 기초(step, reset) 구현
+- **팀원 1:** `NetworkX` 기반 레일 그래프 설계 및 `oht_env.py` 기초(step, reset) 구현
 - **팀원 2:** OHT의 상태(State) 정보(위치, 목적지, 속도) 및 행동(Action) 정의 확정
 - **팀원 3:** 비교군이 될 '최단 경로(Dijkstra) 기반 이동 규칙' 베이스라인 코드 작성
 - **공통 과업:** 주말까지 **"OHT 1대가 충돌 없이 목적지에 도착하는 환경"** 검증
@@ -72,8 +72,9 @@
 - **Language**: Python 3.10+
 - **RL Framework**: Ray RLlib, PettingZoo
 - **Environment**: Gymnasium, NetworkX
-- **Deep Learning**: PyTorch (MPS/Metal acceleration for M4 Mac)
+- **Deep Learning**: PyTorch 
 - **Tracking**: Weights & Biases (W&B)
 
 # 참고 사이트
-- https://flatland.aicrowd.com/intro.html
+- https://flatland-association.github.io/flatland-book/intro.html
+- https://github.com/flatland-association/flatland-rl
