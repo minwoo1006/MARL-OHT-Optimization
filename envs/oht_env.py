@@ -6,59 +6,77 @@ class OHTFabEnv:
         self.graph = create_fab_graph()
         self.num_ohts = num_ohts
         self.agents = [i for i in range(num_ohts)]
+        
         self.agent_positions = {}
+        self.agent_targets = {} # 각 OHT의 목적지
     
     def reset(self):
-        """에피소드 시작 시 OHT들을 팹의 포트(Port)에 무작위로 배치합니다."""
+        """OHT들을 무작위 포트에 배치하고 목적지를 할당합니다."""
         ports = [n for n, d in self.graph.nodes(data=True) if d.get('is_port')]
-        # 중복 없이 시작 위치 선정
         start_nodes = random.sample(ports, self.num_ohts)
         
         for agent in self.agents:
             self.agent_positions[agent] = start_nodes[agent]
+            # 출발지와 다른 무작위 포트를 목적지로 설정
+            target = random.choice([p for p in ports if p != start_nodes[agent]])
+            self.agent_targets[agent] = target
             
         return self._get_obs(), {}
 
     def _get_obs(self):
-        """각 OHT의 현재 위치(x, y)를 관측값으로 반환합니다."""
         return {agent: self.agent_positions[agent] for agent in self.agents}
 
+    def render(self, step):
+        """간단한 텍스트(Console) 시각화"""
+        print(f"--- [Step {step}] OHT 현황 ---")
+        for agent in self.agents:
+            pos = self.agent_positions[agent]
+            target = self.agent_targets[agent]
+            print(f" 🚛 OHT {agent}: 현재 {pos} ➡️ 목적지 {target}")
+        print("-" * 25)
+
     def step(self, action_dict):
-        obs, rewards, dones, info = {}, {}, {'__all__': False}, {}
-        
-        # [Flatland 철학 1단계] 독립 이동 계산 (희망 다음 위치 찾기)
+        obs, rewards, dones, info = {}, {}, {'__all__': True}, {}
         intended_positions = {}
+        
+        # 1. Action Space: 행동 해석 및 희망 위치 계산
         for agent, action in action_dict.items():
             curr_node = self.agent_positions[agent]
-            neighbors = list(self.graph.successors(curr_node)) # 갈 수 있는 다음 노드들
+            neighbors = list(self.graph.successors(curr_node)) # 연결된 다음 노드들
             
-            # Action 1(전진)이고 갈 길이 있다면 첫 번째 경로로 이동한다고 가정
-            if action == 1 and len(neighbors) > 0:
-                intended_positions[agent] = neighbors[0]
-            else:
-                # Action 0(정지) 또는 막다른 길이면 제자리
+            if action == 0: # 정지
                 intended_positions[agent] = curr_node
+                rewards[agent] = -0.1 
+            elif action > 0 and action <= len(neighbors): # 1번 또는 2번 경로 선택
+                intended_positions[agent] = neighbors[action - 1] # 인덱스는 0부터 시작
+                rewards[agent] = -0.1
+            else: # 없는 길(예: 갈림길이 아닌데 2번 선택)
+                intended_positions[agent] = curr_node
+                rewards[agent] = -1.0 # 잘못된 명령 페널티
                 
-        # [Flatland 철학 2단계] 모션 체크 및 데드락 감지
-        # 두 대 이상의 OHT가 같은 칸(Node)으로 가려고 하는지 카운트
+        # 2. 충돌 감지 (모션 체크)
         pos_counts = {}
         for pos in intended_positions.values():
             pos_counts[pos] = pos_counts.get(pos, 0) + 1
             
-        # [Flatland 철학 3단계] 실제 이동 승인 및 보상(Reward) 부여
+        # 3. 이동 승인 및 보상 함수(Reward Function) 적용
         for agent in self.agents:
             next_pos = intended_positions[agent]
             
-            # 가려는 곳에 경쟁자가 없으면 이동 승인!
             if pos_counts[next_pos] == 1:
                 self.agent_positions[agent] = next_pos
-                rewards[agent] = 1 if action == 1 else -0.1 # 전진하면 +1점, 무의미하게 멈추면 -0.1점 페널티
+                
+                # 목적지 도착 체크!
+                if next_pos == self.agent_targets[agent]:
+                    rewards[agent] += 10.0 # 도착 보상
+                    # 실제 프로젝트에서는 여기서 새 목적지를 주거나 대기 상태로 변경
             else:
-                # 충돌 발생! 이동을 취소하고 제자리에 강제 대기시킴
-                rewards[agent] = -10 # 충돌 페널티 크게 부여
+                # 충돌 발생!
+                rewards[agent] = -10.0
                 
             obs[agent] = self.agent_positions[agent]
-            dones[agent] = False
-            info[agent] = {}
+            # 도착하지 않은 OHT가 하나라도 있으면 에피소드는 끝나지 않음
+            if self.agent_positions[agent] != self.agent_targets[agent]:
+                dones['__all__'] = False
             
         return obs, rewards, dones, info

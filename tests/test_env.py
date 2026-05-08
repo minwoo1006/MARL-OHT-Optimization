@@ -18,6 +18,8 @@ def test_random_run():
     # 5 스텝(시간) 동안 아무렇게나(Random) 주행시켜보기
     print("=== 🚦 랜덤 주행 테스트 시작 ===")
     for step in range(500):
+        env.render(step)
+
         action_dict = {}
         # 2대의 OHT에게 0~4 사이의 무작위 행동 지시
         # (0: 기존 행동 유지, 1: 좌회전, 2: 직진, 3: 우회전, 4: 정지)
