@@ -1,5 +1,7 @@
 import random
 from envs.grid_map import create_fab_graph
+import numpy as np
+import networkx as nx
 
 class OHTFabEnv:
     def __init__(self, num_ohts=2):
@@ -24,8 +26,84 @@ class OHTFabEnv:
             
         return self._get_obs(), {}
 
+
     def _get_obs(self):
-        return {agent: self.agent_positions[agent] for agent in self.agents}
+        """모든 OHT의 관측값을 딕셔너리로 반환합니다."""
+        obs = {}
+        for agent in self.agents:
+            obs[agent] = self._compute_single_obs(agent)
+        return obs
+
+    def _compute_single_obs(self, agent):
+        """
+        단일 OHT 에이전트의 시야(Observation)를 7차원 벡터로 계산하여 반환합니다.
+        NetworkX 그래프를 활용해 자신, 전방, 후방, 갈림길 상태를 수치화합니다.
+        """
+        curr_node = self.agent_positions[agent]
+        target_node = self.agent_targets[agent]
+        
+        # 1. Self: 목적지까지의 거리 (정규화)
+        try:
+            # NetworkX의 다익스트라(Dijkstra) 기반 최단 경로 길이 계산
+            dist = nx.shortest_path_length(self.graph, curr_node, target_node)
+        except nx.NetworkXNoPath:
+            dist = 100 # 길이 끊긴 예외 상황 대비
+            
+        max_dist = len(self.graph.nodes) # 맵의 전체 노드 수를 최대 거리로 간주
+        norm_dist = dist / max_dist # 0.0 ~ 1.0 사이로 정규화
+        
+        # 2. Self: 내 상태 (현재는 모두 이동 중이므로 0.0)
+        # 추후 목적지 도착 시 '상하차(Loading) 상태' 구현을 위한 자리입니다.
+        my_state = 0.0
+        
+        # 3 & 4. Forward: 전방 상황 파악
+        forward_dist = 1.0  # 앞이 뻥 뚫려있음 (기본값)
+        forward_state = 0.0 # 앞차의 상태
+        
+        try:
+            path = nx.shortest_path(self.graph, curr_node, target_node)
+            if len(path) > 1:
+                next_node = path[1] # 내가 가야 할 바로 다음 칸
+                
+                # 다음 칸에 다른 OHT가 존재하는지 스캔
+                for other_agent in self.agents:
+                    if other_agent != agent and self.agent_positions[other_agent] == next_node:
+                        forward_dist = 0.0 # 바로 앞에 장애물(OHT) 있음
+                        # 추후 앞차의 my_state(로딩 중인지)를 가져와서 forward_state에 넣을 수 있습니다.
+                        break
+        except nx.NetworkXNoPath:
+            pass
+
+        # 5 & 6. Routing: 갈림길(분기점) 정체도 파악
+        neighbors = list(self.graph.successors(curr_node))
+        branch_a_cong = 0.0
+        branch_b_cong = 0.0
+        
+        if len(neighbors) > 0: # 1번 길 (직진 또는 분기점 A)
+            for other_agent in self.agents:
+                if self.agent_positions[other_agent] == neighbors[0]:
+                    branch_a_cong = 1.0 # 해당 길에 OHT 있음
+                    
+        if len(neighbors) > 1: # 2번 길 (분기점 B)
+            for other_agent in self.agents:
+                if self.agent_positions[other_agent] == neighbors[1]:
+                    branch_b_cong = 1.0 # 해당 길에 OHT 있음
+                    
+        # 7. Rear: 후방 Hot Lot(긴급 물량) 추격 여부 (3주차 구현을 위한 자리)
+        rear_priority = 0.0
+        
+        # 최종 관측치 배열 생성 (인공지능 모델의 '눈')
+        obs_vector = np.array([
+            norm_dist,       # 목적지까지의 상대적 거리
+            my_state,        # 나의 로딩 상태
+            forward_dist,    # 전방 OHT와의 거리
+            forward_state,   # 전방 OHT의 상태
+            branch_a_cong,   # 1번 경로 정체도
+            branch_b_cong,   # 2번 경로 정체도
+            rear_priority    # 후방 긴급 물량 유무
+        ], dtype=np.float32)
+        
+        return obs_vector
 
     def render(self, step, action_dict=None, rewards=None): # 파라미터 추가
         print(f"\n=== [Step {step}] OHT 팹 모니터링 ===")
