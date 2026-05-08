@@ -1,0 +1,5 @@
+networkx==3.2.1
+gymnasium==0.29.1
+pettingzoo==1.24.3
+matplotlib==3.8.2
+# 추후 팀원이 ray[rllib] 등을 추가하게 됩니다.
