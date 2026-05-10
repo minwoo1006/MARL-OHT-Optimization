@@ -8,9 +8,11 @@ from envs.grid_map import create_fab_graph
 class OHTFabEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "oht_fab_v1"}
 
-    def __init__(self, num_ohts=2):
+    def __init__(self, num_ohts=2, max_steps=200):
         self.graph = create_fab_graph()
         self.num_ohts = num_ohts
+        self.max_steps = max_steps
+        self.current_step = 0
         
         # [PettingZoo 규격] 에이전트 이름 리스트
         self.possible_agents = [f"oht_{i}" for i in range(num_ohts)]
@@ -28,13 +30,25 @@ class OHTFabEnv(ParallelEnv):
         self.agent_positions = {}
         self.agent_targets = {}
         self.cumulative_rewards = {}
+        self.delivery_count = 0
+        self.collision_count = 0
+        self.invalid_action_count = 0
         
         # [State Transition] 상태 및 타이머 변수 추가
         self.agent_states = {}   # 0: 이동 중(MOVING), 1: 상하차 중(LOADING)
         self.loading_timers = {} # 상하차 남은 스텝 수
-    
+    def observation_space(self, agent):
+        return self.observation_spaces[agent]
+
+    def action_space(self, agent):
+        return self.action_spaces[agent]
+
     def reset(self, seed=None, options=None):
         self.agents = self.possible_agents[:]
+        self.current_step = 0
+        self.delivery_count = 0
+        self.collision_count = 0
+        self.invalid_action_count = 0
         ports = [n for n, d in self.graph.nodes(data=True) if d.get('is_port')]
         start_nodes = random.sample(ports, self.num_ohts)
         
@@ -62,7 +76,7 @@ class OHTFabEnv(ParallelEnv):
             dist = nx.shortest_path_length(self.graph, curr_node, target_node)
         except nx.NetworkXNoPath:
             dist = 100
-        norm_dist = dist / len(self.graph.nodes)
+        norm_dist = min(dist / len(self.graph.nodes), 1.0)
         
         # 2. 나의 로딩 상태
         my_state = float(self.agent_states[agent])
@@ -99,6 +113,7 @@ class OHTFabEnv(ParallelEnv):
 
     def step(self, action_dict):
         # PettingZoo 최신 step 반환 규격: obs, rewards, terminations, truncations, infos
+        self.current_step += 1
         obs, rewards, terminations, truncations, infos = {}, {}, {}, {}, {}
         intended_positions = {}
         
@@ -134,6 +149,7 @@ class OHTFabEnv(ParallelEnv):
             else:
                 intended_positions[agent] = curr_node
                 rewards[agent] = -1.0 # 에러 페널티
+                self.invalid_action_count += 1
                 
         # 2. 충돌 감지 (모션 체크)
         pos_counts = {}
@@ -152,14 +168,23 @@ class OHTFabEnv(ParallelEnv):
                     # 목적지 도착 이벤트 발생!
                     if next_pos == self.agent_targets[agent]:
                         rewards[agent] += 10.0
+                        self.delivery_count += 1
                         self.agent_states[agent] = 1 # 즉시 LOADING 상태로 전환
                         self.loading_timers[agent] = 5 # 5스텝 딜레이 시작
                 else:
                     rewards[agent] -= 10.0 # 충돌 페널티
-                    
+                    self.collision_count += 1
             self.cumulative_rewards[agent] += rewards[agent]
             obs[agent] = self._compute_single_obs(agent)
-            
+            infos[agent].update({
+                "delivery_count": self.delivery_count,
+                "collision_count": self.collision_count,
+                "invalid_action_count": self.invalid_action_count,
+                "current_step": self.current_step,
+            })
+        if self.current_step >= self.max_steps:
+            truncations = {agent: True for agent in self.agents}
+                
         return obs, rewards, terminations, truncations, infos
 
     def render(self, step, action_dict=None, rewards=None):
