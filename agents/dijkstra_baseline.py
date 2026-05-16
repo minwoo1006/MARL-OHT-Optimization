@@ -75,7 +75,7 @@ class DijkstraBaselineAgent:
 # 베이스라인 실행 함수 (환경과 연결)
 # ──────────────────────────────────────────────
 
-def run_dijkstra_baseline(env, max_steps: int = 500, verbose: bool = True) -> dict:
+def run_dijkstra_baseline(env, max_steps: int = 500, verbose: bool = True, render: bool = False) -> dict:
     """
     Dijkstra 베이스라인으로 한 에피소드를 실행하고 성능 지표를 반환
     """
@@ -92,7 +92,7 @@ def run_dijkstra_baseline(env, max_steps: int = 500, verbose: bool = True) -> di
 
     # 데드락 감지용: 연속으로 같은 노드에 머문 횟수 (LOADING 상태 제외)
     stall_counter = defaultdict(int)
-    STALL_THRESHOLD = 10 
+    STALL_THRESHOLD = 15 
 
     for step in range(max_steps):
         if not env.agents:
@@ -104,6 +104,10 @@ def run_dijkstra_baseline(env, max_steps: int = 500, verbose: bool = True) -> di
 
         prev_positions = env.agent_positions.copy()
         observations, rewards, terminations, truncations, infos = env.step(actions)
+
+        # 렌더링 호출
+        if render:
+            env.render(step, actions, rewards)
 
         # ── 지표 수집 ──
         for agent_id in env.agents:
@@ -147,7 +151,7 @@ if __name__ == "__main__":
     from envs.oht_env import OHTFabEnv
     
     print("🚀 Dijkstra 베이스라인 성능 측정을 시작합니다...")
-    env = OHTFabEnv(num_ohts=5, max_steps=500) # 에이전트 5대로 테스트
+    env = OHTFabEnv(num_ohts=10, max_steps=500) # 에이전트 10대로 테스트
     results = run_dijkstra_baseline(env, verbose=True)
     
     print("\n" + "="*40)

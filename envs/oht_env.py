@@ -30,6 +30,7 @@ class OHTFabEnv(ParallelEnv):
         self.agent_positions = {}
         self.agent_targets = {}
         self.cumulative_rewards = {}
+        self.stall_counters = {} # 데드락 감지용 카운터
         self.delivery_count = 0
         self.collision_count = 0
         self.invalid_action_count = 0
@@ -56,6 +57,7 @@ class OHTFabEnv(ParallelEnv):
             self.agent_positions[agent] = start_nodes[i]
             self.agent_targets[agent] = random.choice([p for p in ports if p != start_nodes[i]])
             self.cumulative_rewards[agent] = 0.0
+            self.stall_counters[agent] = 0 # 초기화
             
             self.agent_states[agent] = 0 # 모두 '이동 중' 상태로 시작
             self.loading_timers[agent] = 0
@@ -116,6 +118,7 @@ class OHTFabEnv(ParallelEnv):
         self.current_step += 1
         obs, rewards, terminations, truncations, infos = {}, {}, {}, {}, {}
         intended_positions = {}
+        prev_positions = self.agent_positions.copy()
         
         # 1. 상태 전이(State Transition) 및 행동 계산
         for agent in self.agents:
@@ -142,7 +145,18 @@ class OHTFabEnv(ParallelEnv):
             
             if action == 0:
                 intended_positions[agent] = curr_node
-                rewards[agent] = -0.1 
+                # [Yielding Reward] 주변에 다른 차가 있는데 멈춰줬다면 보너스
+                neighbors = list(self.graph.successors(curr_node))
+                others_nearby = False
+                for other in self.agents:
+                    if other != agent and self.agent_positions[other] in neighbors:
+                        others_nearby = True
+                        break
+
+                if others_nearby:
+                    rewards[agent] = 0.05 # 양보 보상
+                else:
+                    rewards[agent] = -0.1 # 그냥 대기 페널티
             elif action > 0 and action <= len(neighbors):
                 intended_positions[agent] = neighbors[action - 1]
                 rewards[agent] = -0.1
@@ -158,22 +172,32 @@ class OHTFabEnv(ParallelEnv):
             
         # 3. 이동 승인 및 보상 업데이트
         for agent in self.agents:
-            if self.agent_states[agent] == 1:
-                pass # 로딩 중인 에이전트는 위치 고정이므로 충돌 검사 패스 (단, 누군가 들이받으면 같이 충돌)
-            else:
+            if self.agent_states[agent] == 0: # MOVING 상태에서만 체크
                 next_pos = intended_positions[agent]
                 if pos_counts[next_pos] == 1:
                     self.agent_positions[agent] = next_pos
                     
                     # 목적지 도착 이벤트 발생!
                     if next_pos == self.agent_targets[agent]:
-                        rewards[agent] += 10.0
+                        rewards[agent] += 20.0 # 배송 보상 강화
                         self.delivery_count += 1
                         self.agent_states[agent] = 1 # 즉시 LOADING 상태로 전환
                         self.loading_timers[agent] = 5 # 5스텝 딜레이 시작
                 else:
-                    rewards[agent] -= 10.0 # 충돌 페널티
+                    rewards[agent] -= 15.0 # 충돌 페널티 강화
                     self.collision_count += 1
+
+                # 데드락(Stall) 카운터 업데이트
+                if self.agent_positions[agent] == prev_positions[agent]:
+                    self.stall_counters[agent] += 1
+                else:
+                    self.stall_counters[agent] = 0
+
+                # 조기 종료(Truncation) 처리: 15스텝 이상 정체 시
+                if self.stall_counters[agent] >= 15:
+                    truncations[agent] = True
+                    rewards[agent] -= 50.0 # 데드락 페널티
+            
             self.cumulative_rewards[agent] += rewards[agent]
             obs[agent] = self._compute_single_obs(agent)
             infos[agent].update({
@@ -181,16 +205,19 @@ class OHTFabEnv(ParallelEnv):
                 "collision_count": self.collision_count,
                 "invalid_action_count": self.invalid_action_count,
                 "current_step": self.current_step,
+                "stall_count": self.stall_counters[agent]
             })
+
         if self.current_step >= self.max_steps:
-            truncations = {agent: True for agent in self.agents}
+            for agent in self.agents:
+                truncations[agent] = True
                 
         return obs, rewards, terminations, truncations, infos
 
     def render(self, step, action_dict=None, rewards=None):
-        print(f"\n=== [Step {step}] OHT 팹 모니터링 ===")
-        # 맵 렌더링
-        grid = [[' . ' for _ in range(5)] for _ in range(5)]
+        print(f"\n=== [Step {step}] OHT 팹 모니터링 (Spine-and-Bay) ===")
+        # 신규 맵 크기에 맞게 그리드 동적 생성 (10x6)
+        grid = [[' . ' for _ in range(10)] for _ in range(6)]
         for (x, y), data in self.graph.nodes(data=True):
             grid[y][x] = '[P]' if data.get('is_port') else ' + '
         for agent in self.agents:
@@ -205,11 +232,14 @@ class OHTFabEnv(ParallelEnv):
             pos = self.agent_positions[agent]
             target = self.agent_targets[agent]
             cum_reward = round(self.cumulative_rewards[agent], 2)
+            stall = self.stall_counters[agent]
             
             # 로딩 상태 표시
             state_str = "🚀 주행중"
             if self.agent_states[agent] == 1:
                 state_str = f"📦 로딩중 ({self.loading_timers[agent]}/5)"
+            elif stall > 0:
+                state_str = f"⚠️ 정체 ({stall}/15)"
                 
             act_str = f"| 행동: {action_dict[agent]}" if action_dict and agent in action_dict else ""
             rew_str = f"| 획득: {rewards[agent]}" if rewards and agent in rewards else ""
