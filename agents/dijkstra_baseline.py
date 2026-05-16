@@ -4,11 +4,7 @@ import time
 import random
 import numpy as np
 
-
-# ──────────────────────────────────────────────
 # 핵심 베이스라인 에이전트 클래스
-# ──────────────────────────────────────────────
-
 class DijkstraBaselineAgent:
     def __init__(self, graph: nx.DiGraph):
         """graph: grid_map.py 가 생성한 NetworkX 방향 그래프 (레일 네트워크)"""
