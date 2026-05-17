@@ -175,14 +175,35 @@ class OHTFabEnv(ParallelEnv):
             if self.agent_states[agent] == 0: # MOVING 상태에서만 체크
                 next_pos = intended_positions[agent]
                 if pos_counts[next_pos] == 1:
+                    old_pos = prev_positions[agent]
+                    old_target = self.agent_targets[agent]
+
+                    # 이동 전 거리
+                    try:
+                        old_dist = nx.shortest_path_length(self.graph, old_pos, old_target)
+                    except nx.NetworkXNoPath:
+                        old_dist = 100
+
                     self.agent_positions[agent] = next_pos
-                    
+
+                    # 이동 후 거리
+                    try:
+                        new_dist = nx.shortest_path_length(self.graph, next_pos, old_target)
+                    except nx.NetworkXNoPath:
+                        new_dist = 100
+
+                    # 목적지에 가까워졌으면 작은 보상, 멀어졌으면 작은 페널티
+                    if new_dist < old_dist:
+                        rewards[agent] += 0.2
+                    elif new_dist > old_dist:
+                        rewards[agent] -= 0.2
+
                     # 목적지 도착 이벤트 발생!
                     if next_pos == self.agent_targets[agent]:
-                        rewards[agent] += 20.0 # 배송 보상 강화
+                        rewards[agent] += 20.0
                         self.delivery_count += 1
-                        self.agent_states[agent] = 1 # 즉시 LOADING 상태로 전환
-                        self.loading_timers[agent] = 5 # 5스텝 딜레이 시작
+                        self.agent_states[agent] = 1
+                        self.loading_timers[agent] = 5
                 else:
                     rewards[agent] -= 15.0 # 충돌 페널티 강화
                     self.collision_count += 1
@@ -197,6 +218,9 @@ class OHTFabEnv(ParallelEnv):
                 if self.stall_counters[agent] >= 15:
                     truncations[agent] = True
                     rewards[agent] -= 50.0 # 데드락 페널티
+                    # 한 에이전트라도 데드락이면 episode 전체를 종료
+                    for a in self.agents:
+                        truncations[a] = True
             
             self.cumulative_rewards[agent] += rewards[agent]
             obs[agent] = self._compute_single_obs(agent)
