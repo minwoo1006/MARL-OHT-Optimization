@@ -1,3 +1,7 @@
+'''
+시각화 추가한 버전입니다. 이전에 신욱이가 만든 버전은 혹시나 해서 유지하고 이 파일을 둘게요
+'''
+
 import sys
 import os
 import numpy as np
