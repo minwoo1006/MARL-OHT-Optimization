@@ -1,7 +1,6 @@
 """
 utils/wandb_logger.py
-─────────────────────
-3주차 팀원 3 담당: W&B(Weights & Biases) 학습 곡선 모니터링
+W&B(Weights & Biases) 학습 곡선 모니터링
 
 기록 지표:
   [학습 중 매 iteration]
@@ -16,20 +15,6 @@ utils/wandb_logger.py
   - avg_stall_count     : 평균 정체 카운트 (정체 구간 해소 여부)
   - avg_episode_return  : 평균 에피소드 리턴
   - avg_current_step    : 평균 에피소드 종료 스텝
-
-사용법:
-  train_ppo_rllib.py의 main()에서 아래처럼 호출:
-
-    from utils.wandb_logger import WandBLogger
-    logger = WandBLogger(project="MARL-OHT", run_name="ppo_5ohts_lr3e4")
-    logger.init(config={...})
-
-    for i in range(num_iterations):
-        result = algo.train()
-        logger.log_train(i, result)
-
-    logger.log_eval(summary_2, summary_5, summary_10)
-    logger.finish()
 """
 
 import os
@@ -38,10 +23,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class WandBLogger:
-    """
-    W&B 로깅 래퍼 클래스.
-    wandb가 설치되지 않아도 graceful하게 동작합니다 (콘솔 출력으로 대체).
-    """
 
     def __init__(self, project: str = "MARL-OHT-Optimization", run_name: str = None):
         self.project  = project
@@ -51,11 +32,7 @@ class WandBLogger:
 
     def init(self, config: dict = None):
         """
-        W&B 실행을 초기화합니다.
-        wandb가 없으면 콘솔 출력 모드로 전환합니다.
-
-        Args:
-            config: 하이퍼파라미터 딕셔너리 (학습 설정 기록용)
+        W&B 실행을 초기화
         """
         try:
             import wandb
@@ -79,11 +56,7 @@ class WandBLogger:
 
     def log_train(self, iteration: int, result: dict):
         """
-        매 학습 iteration 결과를 W&B에 기록합니다.
-
-        Args:
-            iteration: 현재 iteration 번호 (0-indexed)
-            result:    algo.train()이 반환한 결과 딕셔너리
+        매 학습 iteration 결과를 W&B에 기록
         """
         env_runners = result.get("env_runners", {})
 
@@ -111,11 +84,7 @@ class WandBLogger:
 
     def log_eval(self, *summaries):
         """
-        평가 완료 후 정책별 비교 지표를 W&B에 기록합니다.
-
-        Args:
-            *summaries: evaluate_*_policy()가 반환한 summary 딕셔너리들
-                        각 딕셔너리는 policy, num_ohts, avg_* 키를 포함해야 함
+        평가 완료 후 정책별 비교 지표를 W&B에 기록
         """
         for summary in summaries:
             policy   = summary.get("policy", "unknown")
@@ -142,12 +111,7 @@ class WandBLogger:
 
     def log_stall(self, iteration: int, stall_data: dict):
         """
-        정체 구간 해소 데이터를 기록합니다.
-        oht_env.py의 stall_counters 평균값을 넘겨주세요.
-
-        Args:
-            iteration:  현재 iteration
-            stall_data: {"avg_stall": float, "max_stall": float, "deadlock_count": int}
+        정체 구간 해소 데이터를 기록
         """
         log_dict = {
             "stall/avg_stall_count":  stall_data.get("avg_stall"),
@@ -167,51 +131,6 @@ class WandBLogger:
             self._wandb.finish()
             print("✅ W&B 기록 완료")
 
-
-# ──────────────────────────────────────────────
-# train_ppo_rllib.py에 연동하는 방법
-# ──────────────────────────────────────────────
-
-"""
-[train_ppo_rllib.py main() 수정 예시]
-
-from utils.wandb_logger import WandBLogger
-
-def main():
-    # 1. logger 초기화
-    logger = WandBLogger(
-        project  = "MARL-OHT-Optimization",
-        run_name = "ppo_5ohts_lr3e4_batch1000"
-    )
-    logger.init(config={
-        "num_ohts":        5,
-        "max_steps":       200,
-        "lr":              3e-4,
-        "train_batch":     1000,
-        "gamma":           0.99,
-        "num_iterations":  1000,
-    })
-
-    # 2. 학습 루프에서 매 iteration 기록
-    for i in range(num_iterations):
-        result = algo.train()
-        logger.log_train(i, result)   # ← 이 한 줄 추가
-
-        if (i + 1) % log_interval == 0 or i == 0:
-            print(...)  # 기존 콘솔 출력 유지
-
-    # 3. 평가 완료 후 비교 지표 기록
-    logger.log_eval(
-        random_2_summary, dijkstra_2_summary, ppo_2_summary,
-        random_5_summary, dijkstra_5_summary, ppo_5_summary,
-        random_10_summary, dijkstra_10_summary, ppo_10_summary,
-    )
-
-    # 4. 종료
-    logger.finish()
-    algo.stop()
-    ray.shutdown()
-"""
 
 
 if __name__ == "__main__":
