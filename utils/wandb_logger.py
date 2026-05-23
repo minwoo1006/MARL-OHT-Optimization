@@ -1,0 +1,247 @@
+"""
+utils/wandb_logger.py
+─────────────────────
+3주차 팀원 3 담당: W&B(Weights & Biases) 학습 곡선 모니터링
+
+기록 지표:
+  [학습 중 매 iteration]
+  - episode_return_mean / min / max  : 학습 수렴 여부
+  - episode_len_mean                 : 에피소드 평균 길이
+  - num_episodes                     : 총 에피소드 수
+  - env_steps_total                  : 누적 환경 스텝 수
+
+  [평가 완료 후]
+  - avg_delivery_count  : 평균 배송 횟수 (Throughput)
+  - avg_collision_count : 평균 충돌 횟수
+  - avg_stall_count     : 평균 정체 카운트 (정체 구간 해소 여부)
+  - avg_episode_return  : 평균 에피소드 리턴
+  - avg_current_step    : 평균 에피소드 종료 스텝
+
+사용법:
+  train_ppo_rllib.py의 main()에서 아래처럼 호출:
+
+    from utils.wandb_logger import WandBLogger
+    logger = WandBLogger(project="MARL-OHT", run_name="ppo_5ohts_lr3e4")
+    logger.init(config={...})
+
+    for i in range(num_iterations):
+        result = algo.train()
+        logger.log_train(i, result)
+
+    logger.log_eval(summary_2, summary_5, summary_10)
+    logger.finish()
+"""
+
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class WandBLogger:
+    """
+    W&B 로깅 래퍼 클래스.
+    wandb가 설치되지 않아도 graceful하게 동작합니다 (콘솔 출력으로 대체).
+    """
+
+    def __init__(self, project: str = "MARL-OHT-Optimization", run_name: str = None):
+        self.project  = project
+        self.run_name = run_name
+        self._wandb   = None
+        self._enabled = False
+
+    def init(self, config: dict = None):
+        """
+        W&B 실행을 초기화합니다.
+        wandb가 없으면 콘솔 출력 모드로 전환합니다.
+
+        Args:
+            config: 하이퍼파라미터 딕셔너리 (학습 설정 기록용)
+        """
+        try:
+            import wandb
+            self._wandb = wandb
+            wandb.init(
+                project = self.project,
+                name    = self.run_name,
+                config  = config or {},
+            )
+            self._enabled = True
+            print(f"✅ W&B 연동 성공 | Project: {self.project} | Run: {self.run_name}")
+            print(f"   대시보드: {wandb.run.get_url()}")
+        except ImportError:
+            print("⚠️  wandb가 설치되지 않았습니다. 콘솔 출력 모드로 실행합니다.")
+            print("   설치: pip install wandb")
+            self._enabled = False
+        except Exception as e:
+            print(f"⚠️  W&B 초기화 실패: {e}")
+            print("   콘솔 출력 모드로 실행합니다.")
+            self._enabled = False
+
+    def log_train(self, iteration: int, result: dict):
+        """
+        매 학습 iteration 결과를 W&B에 기록합니다.
+
+        Args:
+            iteration: 현재 iteration 번호 (0-indexed)
+            result:    algo.train()이 반환한 결과 딕셔너리
+        """
+        env_runners = result.get("env_runners", {})
+
+        log_dict = {
+            "train/iteration":           iteration + 1,
+            "train/episode_return_mean": env_runners.get("episode_return_mean"),
+            "train/episode_return_min":  env_runners.get("episode_return_min"),
+            "train/episode_return_max":  env_runners.get("episode_return_max"),
+            "train/episode_len_mean":    env_runners.get("episode_len_mean"),
+            "train/num_episodes":        env_runners.get("num_episodes"),
+            "train/env_steps_total":     env_runners.get("num_env_steps_sampled_lifetime"),
+            "train/module_steps_total":  env_runners.get("num_module_steps_sampled_lifetime"),
+        }
+
+        # None 값 제거
+        log_dict = {k: v for k, v in log_dict.items() if v is not None}
+
+        if self._enabled:
+            self._wandb.log(log_dict, step=iteration + 1)
+        else:
+            # W&B 없을 때 콘솔 출력
+            mean = log_dict.get("train/episode_return_mean", "N/A")
+            steps = log_dict.get("train/env_steps_total", "N/A")
+            print(f"  [W&B-console] iter={iteration+1} | return_mean={mean} | env_steps={steps}")
+
+    def log_eval(self, *summaries):
+        """
+        평가 완료 후 정책별 비교 지표를 W&B에 기록합니다.
+
+        Args:
+            *summaries: evaluate_*_policy()가 반환한 summary 딕셔너리들
+                        각 딕셔너리는 policy, num_ohts, avg_* 키를 포함해야 함
+        """
+        for summary in summaries:
+            policy   = summary.get("policy", "unknown")
+            num_ohts = summary.get("num_ohts", 0)
+            prefix   = f"eval/{policy}_{num_ohts}ohts"
+
+            log_dict = {
+                f"{prefix}/avg_delivery_count":     summary.get("avg_delivery_count"),
+                f"{prefix}/avg_collision_count":    summary.get("avg_collision_count"),
+                f"{prefix}/avg_invalid_action":     summary.get("avg_invalid_action_count"),
+                f"{prefix}/avg_episode_return":     summary.get("avg_episode_return"),
+                f"{prefix}/avg_current_step":       summary.get("avg_current_step"),
+            }
+
+            log_dict = {k: v for k, v in log_dict.items() if v is not None}
+
+            if self._enabled:
+                self._wandb.log(log_dict)
+            else:
+                print(f"  [W&B-console] EVAL | {policy} {num_ohts}ohts | "
+                      f"delivery={summary.get('avg_delivery_count', 'N/A'):.2f} | "
+                      f"collision={summary.get('avg_collision_count', 'N/A'):.2f} | "
+                      f"return={summary.get('avg_episode_return', 'N/A'):.2f}")
+
+    def log_stall(self, iteration: int, stall_data: dict):
+        """
+        정체 구간 해소 데이터를 기록합니다.
+        oht_env.py의 stall_counters 평균값을 넘겨주세요.
+
+        Args:
+            iteration:  현재 iteration
+            stall_data: {"avg_stall": float, "max_stall": float, "deadlock_count": int}
+        """
+        log_dict = {
+            "stall/avg_stall_count":  stall_data.get("avg_stall"),
+            "stall/max_stall_count":  stall_data.get("max_stall"),
+            "stall/deadlock_count":   stall_data.get("deadlock_count"),
+        }
+        log_dict = {k: v for k, v in log_dict.items() if v is not None}
+
+        if self._enabled:
+            self._wandb.log(log_dict, step=iteration + 1)
+        else:
+            print(f"  [W&B-console] STALL | iter={iteration+1} | {stall_data}")
+
+    def finish(self):
+        """W&B 실행을 종료합니다."""
+        if self._enabled:
+            self._wandb.finish()
+            print("✅ W&B 기록 완료")
+
+
+# ──────────────────────────────────────────────
+# train_ppo_rllib.py에 연동하는 방법
+# ──────────────────────────────────────────────
+
+"""
+[train_ppo_rllib.py main() 수정 예시]
+
+from utils.wandb_logger import WandBLogger
+
+def main():
+    # 1. logger 초기화
+    logger = WandBLogger(
+        project  = "MARL-OHT-Optimization",
+        run_name = "ppo_5ohts_lr3e4_batch1000"
+    )
+    logger.init(config={
+        "num_ohts":        5,
+        "max_steps":       200,
+        "lr":              3e-4,
+        "train_batch":     1000,
+        "gamma":           0.99,
+        "num_iterations":  1000,
+    })
+
+    # 2. 학습 루프에서 매 iteration 기록
+    for i in range(num_iterations):
+        result = algo.train()
+        logger.log_train(i, result)   # ← 이 한 줄 추가
+
+        if (i + 1) % log_interval == 0 or i == 0:
+            print(...)  # 기존 콘솔 출력 유지
+
+    # 3. 평가 완료 후 비교 지표 기록
+    logger.log_eval(
+        random_2_summary, dijkstra_2_summary, ppo_2_summary,
+        random_5_summary, dijkstra_5_summary, ppo_5_summary,
+        random_10_summary, dijkstra_10_summary, ppo_10_summary,
+    )
+
+    # 4. 종료
+    logger.finish()
+    algo.stop()
+    ray.shutdown()
+"""
+
+
+if __name__ == "__main__":
+    # 단독 실행 테스트 (W&B 연결 없이 콘솔 출력 확인)
+    print("=== WandBLogger 단독 테스트 ===")
+
+    logger = WandBLogger(project="MARL-OHT-Optimization", run_name="test_run")
+    logger.init(config={"num_ohts": 5, "lr": 3e-4})
+
+    # 가짜 학습 결과로 테스트
+    fake_result = {
+        "env_runners": {
+            "episode_return_mean": -120.5,
+            "episode_return_min":  -300.0,
+            "episode_return_max":   50.0,
+            "episode_len_mean":     85.3,
+            "num_episodes":         12,
+            "num_env_steps_sampled_lifetime": 1000,
+        }
+    }
+    logger.log_train(0, fake_result)
+
+    # 가짜 평가 결과로 테스트
+    fake_summary = {
+        "policy": "ppo", "num_ohts": 5,
+        "avg_delivery_count": 19.6,
+        "avg_collision_count": 30.0,
+        "avg_invalid_action_count": 0.0,
+        "avg_episode_return": -130.78,
+        "avg_current_step": 91.0,
+    }
+    logger.log_eval(fake_summary)
+    logger.finish()

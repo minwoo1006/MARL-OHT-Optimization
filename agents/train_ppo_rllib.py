@@ -15,10 +15,14 @@ from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.env.wrappers.pettingzoo_env import ParallelPettingZooEnv
 
 from envs.oht_env import OHTFabEnv
-from utils.visualization import OHTVisualizer  # [추가] 시각화 임포트
+from utils.wandb_logger import WandBLogger  # ✅ [추가] W&B 로거 임포트
 
 
 def env_creator(config):
+    """
+    RLlib이 호출할 환경 생성 함수.
+    OHTFabEnv를 PettingZoo ParallelEnv wrapper로 감싼다.
+    """
     num_ohts = config.get("num_ohts", 5)
     max_steps = config.get("max_steps", 200)
     raw_env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps)
@@ -26,10 +30,18 @@ def env_creator(config):
 
 
 def policy_mapping_fn(agent_id, *args, **kwargs):
+    """
+    모든 OHT가 같은 정책을 공유한다.
+    즉, oht_0, oht_1, ... 모두 shared_policy 사용.
+    """
     return "shared_policy"
 
 
 def safe_compute_action(algo, obs, env=None, agent_id=None):
+    """
+    Ray RLlib new API stack 기준으로 학습된 RLModule에서 action을 계산한다.
+    env와 agent_id가 주어지면 현재 노드에서 가능한 action만 선택하도록 masking한다.
+    """
     module = algo.get_module("shared_policy")
 
     try:
@@ -77,11 +89,7 @@ def safe_compute_action(algo, obs, env=None, agent_id=None):
     return int(action_tensor.detach().cpu().numpy().reshape(-1)[0])
 
 
-def evaluate_ppo_policy(algo, num_ohts=5, max_steps=200, num_episodes=5, visualize=False):  # ✅ [수정] render → visualize
-    """
-    학습된 PPO policy를 실제 OHTFabEnv에서 평가한다.
-    visualize=True이면 Pygame 시각화를 띄운다.
-    """
+def evaluate_ppo_policy(algo, num_ohts=5, max_steps=200, num_episodes=5, render=False):
     episode_results = []
 
     for episode_idx in range(num_episodes):
@@ -89,36 +97,18 @@ def evaluate_ppo_policy(algo, num_ohts=5, max_steps=200, num_episodes=5, visuali
         obs, infos = env.reset()
         episode_return = 0.0
 
-        # [추가] 에피소드마다 시각화 초기화
-        viz = None
-        if visualize:
-            viz = OHTVisualizer(env, fps=6)
-            viz.init()
-
         for step in range(max_steps):
             action_dict = {}
             for agent_id in env.agents:
                 action_dict[agent_id] = safe_compute_action(
                     algo, obs[agent_id], env=env, agent_id=agent_id,
                 )
-
-            prev_positions = env.agent_positions.copy()  # [추가] 충돌 감지용
             obs, rewards, terminations, truncations, infos = env.step(action_dict)
             episode_return += sum(rewards.values())
-
-            # [추가] 스냅샷 저장 및 렌더링 (기존 env.render() 텍스트 출력 대체)
-            if viz:
-                collision_nodes = viz.detect_collisions(prev_positions, env)
-                viz.push_snapshot(step, infos, collision_nodes)
-                if not viz.render():
-                    break
-
+            if render:
+                env.render(step=step + 1, action_dict=action_dict, rewards=rewards)
             if all(terminations.values()) or all(truncations.values()):
                 break
-
-        # [추가] 에피소드 종료 시 시각화 닫기
-        if viz:
-            viz.close()
 
         episode_results.append({
             "episode": episode_idx + 1,
@@ -144,7 +134,7 @@ def evaluate_ppo_policy(algo, num_ohts=5, max_steps=200, num_episodes=5, visuali
     return summary, episode_results
 
 
-def evaluate_random_policy(num_ohts=5, max_steps=200, num_episodes=5, visualize=False):  # ✅ [추가] visualize 파라미터
+def evaluate_random_policy(num_ohts=5, max_steps=200, num_episodes=5):
     episode_results = []
 
     for episode_idx in range(num_episodes):
@@ -152,35 +142,15 @@ def evaluate_random_policy(num_ohts=5, max_steps=200, num_episodes=5, visualize=
         obs, infos = env.reset()
         episode_return = 0.0
 
-        # [추가] 시각화 초기화
-        viz = None
-        if visualize:
-            viz = OHTVisualizer(env, fps=6)
-            viz.init()
-
         for step in range(max_steps):
             action_dict = {
                 agent_id: env.action_space(agent_id).sample()
                 for agent_id in env.agents
             }
-
-            prev_positions = env.agent_positions.copy()  # [추가]
             obs, rewards, terminations, truncations, infos = env.step(action_dict)
             episode_return += sum(rewards.values())
-
-            # [추가] 스냅샷 저장 및 렌더링
-            if viz:
-                collision_nodes = viz.detect_collisions(prev_positions, env)
-                viz.push_snapshot(step, infos, collision_nodes)
-                if not viz.render():
-                    break
-
             if all(terminations.values()) or all(truncations.values()):
                 break
-
-        # [추가] 시각화 종료
-        if viz:
-            viz.close()
 
         episode_results.append({
             "episode": episode_idx + 1,
@@ -206,8 +176,10 @@ def evaluate_random_policy(num_ohts=5, max_steps=200, num_episodes=5, visualize=
     return summary, episode_results
 
 
-def evaluate_dijkstra_policy(num_ohts=5, max_steps=200, num_episodes=5, visualize=False):  # ✅ [추가] visualize 파라미터
-    from agents.dijkstra_baseline import DijkstraBaselineAgent
+from agents.dijkstra_baseline import DijkstraBaselineAgent
+
+
+def evaluate_dijkstra_policy(num_ohts=5, max_steps=200, num_episodes=5):
     episode_results = []
 
     for episode_idx in range(num_episodes):
@@ -216,35 +188,15 @@ def evaluate_dijkstra_policy(num_ohts=5, max_steps=200, num_episodes=5, visualiz
         dijkstra_agent = DijkstraBaselineAgent(env.graph)
         episode_return = 0.0
 
-        # [추가] 시각화 초기화
-        viz = None
-        if visualize:
-            viz = OHTVisualizer(env, fps=6)
-            viz.init()
-
         for step in range(max_steps):
             action_dict = {
                 agent_id: dijkstra_agent.get_action(env, agent_id)
                 for agent_id in env.agents
             }
-
-            prev_positions = env.agent_positions.copy()  # [추가]
             obs, rewards, terminations, truncations, infos = env.step(action_dict)
             episode_return += sum(rewards.values())
-
-            # [추가] 스냅샷 저장 및 렌더링
-            if viz:
-                collision_nodes = viz.detect_collisions(prev_positions, env)
-                viz.push_snapshot(step, infos, collision_nodes)
-                if not viz.render():
-                    break
-
             if all(terminations.values()) or all(truncations.values()):
                 break
-
-        # [추가] 시각화 종료
-        if viz:
-            viz.close()
 
         episode_results.append({
             "episode": episode_idx + 1,
@@ -317,41 +269,79 @@ def main():
 
     algo = config.build_algo()
 
+    # ✅ [추가] W&B 로거 초기화
+    logger = WandBLogger(
+        project  = "MARL-OHT-Optimization",
+        run_name = "ppo_5ohts_lr3e4_batch1000"
+    )
+    logger.init(config={
+        "num_ohts":       5,
+        "max_steps":      200,
+        "lr":             3e-4,
+        "train_batch":    1000,
+        "gamma":          0.99,
+        "num_iterations": 1000,
+    })
+
+    # =========================
+    # 1. PPO 학습
+    # =========================
     num_iterations = 1000
     log_interval = 10
 
     for i in range(num_iterations):
         result = algo.train()
+
+        # ✅ [추가] 매 iteration W&B에 기록
+        logger.log_train(i, result)
+
         env_runners = result.get("env_runners", {})
+        episode_return_mean = env_runners.get("episode_return_mean")
+        episode_return_min  = env_runners.get("episode_return_min")
+        episode_return_max  = env_runners.get("episode_return_max")
+        episode_len_mean    = env_runners.get("episode_len_mean")
+        num_episodes        = env_runners.get("num_episodes")
+        num_env_steps       = env_runners.get("num_env_steps_sampled_lifetime")
+        num_module_steps    = env_runners.get("num_module_steps_sampled_lifetime")
 
         if (i + 1) % log_interval == 0 or i == 0:
             print("=" * 60)
             print(f"Iteration {i + 1}")
-            print(f"episode_return_mean : {env_runners.get('episode_return_mean')}")
-            print(f"episode_return_min  : {env_runners.get('episode_return_min')}")
-            print(f"episode_return_max  : {env_runners.get('episode_return_max')}")
-            print(f"episode_len_mean    : {env_runners.get('episode_len_mean')}")
-            print(f"num_episodes        : {env_runners.get('num_episodes')}")
-            print(f"env_steps_total     : {env_runners.get('num_env_steps_sampled_lifetime')}")
+            print(f"episode_return_mean : {episode_return_mean}")
+            print(f"episode_return_min  : {episode_return_min}")
+            print(f"episode_return_max  : {episode_return_max}")
+            print(f"episode_len_mean    : {episode_len_mean}")
+            print(f"num_episodes        : {num_episodes}")
+            print(f"env_steps_total     : {num_env_steps}")
+            print(f"module_steps_total  : {num_module_steps}")
 
+    # =========================
+    # 2. Random / Dijkstra / PPO 비교 평가
+    # =========================
     print("\nRunning policy evaluation...")
 
-    # [수정] render=False → visualize=False (파라미터명 통일)
     random_2_summary,   _ = evaluate_random_policy(num_ohts=2,  max_steps=200, num_episodes=20)
     dijkstra_2_summary, _ = evaluate_dijkstra_policy(num_ohts=2, max_steps=200, num_episodes=20)
-    ppo_2_summary,      _ = evaluate_ppo_policy(algo, num_ohts=2, max_steps=200, num_episodes=20)
-    print_comparison_table([random_2_summary, dijkstra_2_summary, ppo_2_summary], "Policy Comparison: 2 OHTs")
+    ppo_2_summary,      _ = evaluate_ppo_policy(algo, num_ohts=2, max_steps=200, num_episodes=20, render=False)
+    print_comparison_table([random_2_summary, dijkstra_2_summary, ppo_2_summary], title="Policy Comparison: 2 OHTs")
 
     random_5_summary,   _ = evaluate_random_policy(num_ohts=5,  max_steps=200, num_episodes=20)
     dijkstra_5_summary, _ = evaluate_dijkstra_policy(num_ohts=5, max_steps=200, num_episodes=20)
-    ppo_5_summary,      _ = evaluate_ppo_policy(algo, num_ohts=5, max_steps=200, num_episodes=5)
-    print_comparison_table([random_5_summary, dijkstra_5_summary, ppo_5_summary], "Policy Comparison: 5 OHTs")
+    ppo_5_summary,      _ = evaluate_ppo_policy(algo, num_ohts=5, max_steps=200, num_episodes=5,  render=False)
+    print_comparison_table([random_5_summary, dijkstra_5_summary, ppo_5_summary], title="Policy Comparison: 5 OHTs")
 
     random_10_summary,   _ = evaluate_random_policy(num_ohts=10, max_steps=200, num_episodes=20)
     dijkstra_10_summary, _ = evaluate_dijkstra_policy(num_ohts=10, max_steps=200, num_episodes=20)
-    ppo_10_summary,      _ = evaluate_ppo_policy(algo, num_ohts=10, max_steps=200, num_episodes=20,
-                                                  visualize=True)  # ✅ [수정] PPO 10대 평가 시 시각화 ON
-    print_comparison_table([random_10_summary, dijkstra_10_summary, ppo_10_summary], "Policy Comparison: 10 OHTs")
+    ppo_10_summary,      _ = evaluate_ppo_policy(algo, num_ohts=10, max_steps=200, num_episodes=20, render=False)
+    print_comparison_table([random_10_summary, dijkstra_10_summary, ppo_10_summary], title="Policy Comparison: 10 OHTs")
+
+    # ✅ [추가] 평가 결과 W&B에 기록 후 종료
+    logger.log_eval(
+        random_2_summary,  dijkstra_2_summary,  ppo_2_summary,
+        random_5_summary,  dijkstra_5_summary,  ppo_5_summary,
+        random_10_summary, dijkstra_10_summary, ppo_10_summary,
+    )
+    logger.finish()
 
     algo.stop()
     ray.shutdown()
