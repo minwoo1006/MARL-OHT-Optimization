@@ -6,24 +6,42 @@ from gymnasium.spaces import Discrete, Box
 from envs.grid_map import create_fab_graph
 from utils.scenario_scheduler import ScenarioScheduler, create_default_scenario
 
+DEFAULT_REWARD_CONFIG = {
+    "wait_penalty": -0.1,
+    "invalid_action_penalty": -0.1,
+    "move_penalty": -0.1,
+    "yield_reward": 0.05,
+    "hot_lot_yield_reward": 2.0,
+    "progress_reward": 0.2,
+    "regress_penalty": -0.2,
+    "normal_delivery_reward": 20.0,
+    "hot_lot_delivery_reward": 50.0,
+    "collision_penalty": -15.0,
+    "stall_penalty": -50.0,
+    "stall_threshold": 15,
+    "loading_steps": 5,
+}
+
+
 class OHTFabEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "oht_fab_v1"}
 
-    def __init__(self, num_ohts=2, max_steps=200, scheduler=None, **map_kwargs):
+    def __init__(self, num_ohts=2, max_steps=200, scheduler=None, reward_config=None, **map_kwargs):
         # 수백 x 수백 스케일 지원 (기본 300x200)
         if not map_kwargs:
             map_kwargs = {"width": 300, "height": 200, "bay_interval": 30, "bay_depth": 20}
             
         self.graph = create_fab_graph(layout_type="mega", **map_kwargs)
+        self._init_graph_caches()
         self.num_ohts = num_ohts
         self.max_steps = max_steps
         self.current_step = 0
+        self.reward_config = {**DEFAULT_REWARD_CONFIG, **(reward_config or {})}
         
         # [MES 연동] 시나리오 스케줄러 설정
         self.scheduler = scheduler
         if self.scheduler is None:
-            ports = [n for n, d in self.graph.nodes(data=True) if d.get('is_port')]
-            tasks = create_default_scenario(ports, num_tasks=max_steps * num_ohts)
+            tasks = create_default_scenario(self.port_nodes, num_tasks=max_steps * num_ohts)
             self.scheduler = ScenarioScheduler(tasks)
 
         # [PettingZoo 규격] 에이전트 이름 리스트
@@ -45,12 +63,53 @@ class OHTFabEnv(ParallelEnv):
         self.cumulative_rewards = {}
         self.stall_counters = {} # 데드락 감지용 카운터
         self.delivery_count = 0
+        self.hot_lot_delivery_count = 0
         self.collision_count = 0
         self.invalid_action_count = 0
         
         # [State Transition] 상태 및 타이머 변수 추가
         self.agent_states = {}   # 0: 이동 중(MOVING), 1: 상하차 중(LOADING)
         self.loading_timers = {} # 상하차 남은 스텝 수
+
+    def _init_graph_caches(self):
+        self.node_count = len(self.graph.nodes)
+        self.port_nodes = [n for n, d in self.graph.nodes(data=True) if d.get('is_port')]
+        self.successors_cache = {
+            node: list(self.graph.successors(node))
+            for node in self.graph.nodes
+        }
+        self.predecessors_cache = {
+            node: list(self.graph.predecessors(node))
+            for node in self.graph.nodes
+        }
+        self.reverse_graph = self.graph.reverse(copy=False)
+        self.shortest_dist = {}
+
+    def _get_dist_map_to_target(self, target):
+        if target not in self.shortest_dist:
+            self.shortest_dist[target] = nx.single_source_shortest_path_length(
+                self.reverse_graph,
+                target,
+            )
+        return self.shortest_dist[target]
+
+    def _get_shortest_dist(self, source, target):
+        return self._get_dist_map_to_target(target).get(source, 100)
+
+    def _get_next_hop(self, source, target):
+        if source == target:
+            return None
+
+        dist_map = self._get_dist_map_to_target(target)
+        candidates = [
+            (dist_map[next_node], next_node)
+            for next_node in self.successors_cache[source]
+            if next_node in dist_map
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[0])[1]
+
     def observation_space(self, agent):
         return self.observation_spaces[agent]
 
@@ -61,12 +120,12 @@ class OHTFabEnv(ParallelEnv):
         self.agents = self.possible_agents[:]
         self.current_step = 0
         self.delivery_count = 0
+        self.hot_lot_delivery_count = 0
         self.collision_count = 0
         self.invalid_action_count = 0
         
         # 스케줄러 초기화
-        ports = [n for n, d in self.graph.nodes(data=True) if d.get('is_port')]
-        tasks = create_default_scenario(ports, num_tasks=self.max_steps * self.num_ohts)
+        tasks = create_default_scenario(self.port_nodes, num_tasks=self.max_steps * self.num_ohts)
         self.scheduler.reset(tasks)
 
         for i, agent in enumerate(self.agents):
@@ -76,7 +135,7 @@ class OHTFabEnv(ParallelEnv):
                 self.agent_targets[agent] = task.goal_node
                 self.agent_priorities[agent] = 1 if task.is_hot_lot else 0
             else:
-                self.agent_positions[agent] = random.choice(ports)
+                self.agent_positions[agent] = random.choice(self.port_nodes)
                 self.agent_targets[agent] = self.agent_positions[agent]
                 self.agent_priorities[agent] = 0
 
@@ -98,10 +157,7 @@ class OHTFabEnv(ParallelEnv):
         target_node = self.agent_targets[agent]
         
         # 1. 목적지 거리 정규화
-        try:
-            dist = nx.shortest_path_length(self.graph, curr_node, target_node)
-        except nx.NetworkXNoPath:
-            dist = 100
+        dist = self._get_shortest_dist(curr_node, target_node)
         norm_dist = min(dist / 100.0, 1.0) # 고정값으로 정규화 (맵 확장 대비)
         
         # 2. 나의 로딩 상태
@@ -109,20 +165,16 @@ class OHTFabEnv(ParallelEnv):
         
         # 3 & 4. 전방 거리 및 앞차 상태
         forward_dist, forward_state = 1.0, 0.0
-        try:
-            path = nx.shortest_path(self.graph, curr_node, target_node)
-            if len(path) > 1:
-                next_node = path[1]
-                for other_agent in self.agents:
-                    if other_agent != agent and self.agent_positions[other_agent] == next_node:
-                        forward_dist = 0.0
-                        forward_state = float(self.agent_states[other_agent])
-                        break
-        except nx.NetworkXNoPath:
-            pass
+        next_node = self._get_next_hop(curr_node, target_node)
+        if next_node is not None:
+            for other_agent in self.agents:
+                if other_agent != agent and self.agent_positions[other_agent] == next_node:
+                    forward_dist = 0.0
+                    forward_state = float(self.agent_states[other_agent])
+                    break
 
         # 5 & 6. 갈림길 정체도 (Spine-and-Bay 구조 기반)
-        neighbors = list(self.graph.successors(curr_node))
+        neighbors = self.successors_cache[curr_node]
         branch_a_cong, branch_b_cong = 0.0, 0.0
         if len(neighbors) > 0:
             for other_agent in self.agents:
@@ -139,7 +191,7 @@ class OHTFabEnv(ParallelEnv):
         rear_hot_lot_present = 0.0
         
         # 나를 향해 오는 노드들(Predecessors) 탐색
-        preds = list(self.graph.predecessors(curr_node))
+        preds = self.predecessors_cache[curr_node]
         for p in preds:
             for other in self.agents:
                 if other != agent and self.agent_positions[other] == p:
@@ -187,7 +239,7 @@ class OHTFabEnv(ParallelEnv):
             # [State 0: MOVING 중일 때] - 들어온 Action 처리
             action = action_dict.get(agent, 0)
             curr_node = self.agent_positions[agent]
-            neighbors = list(self.graph.successors(curr_node))
+            neighbors = self.successors_cache[curr_node]
             
             if action == 0:
                 intended_positions[agent] = curr_node
@@ -202,7 +254,7 @@ class OHTFabEnv(ParallelEnv):
                             break
                 
                 if is_yielding_for_hot_lot:
-                    rewards[agent] = 2.0 # 적극적 양보 보상
+                    rewards[agent] = self.reward_config["hot_lot_yield_reward"]
                 else:
                     # 일반 양보 보상 체크
                     others_nearby = False
@@ -210,13 +262,17 @@ class OHTFabEnv(ParallelEnv):
                         if other != agent and self.agent_positions[other] in neighbors:
                             others_nearby = True
                             break
-                    rewards[agent] = 0.05 if others_nearby else -0.1
+                    rewards[agent] = (
+                        self.reward_config["yield_reward"]
+                        if others_nearby
+                        else self.reward_config["wait_penalty"]
+                    )
             elif action > 0 and action <= len(neighbors):
                 intended_positions[agent] = neighbors[action - 1]
-                rewards[agent] = -0.1
+                rewards[agent] = self.reward_config["move_penalty"]
             else:
                 intended_positions[agent] = curr_node
-                rewards[agent] = -1.0 # 에러 페널티
+                rewards[agent] = self.reward_config["invalid_action_penalty"]
                 self.invalid_action_count += 1
                 
         # 2. 충돌 감지 (모션 체크)
@@ -232,36 +288,34 @@ class OHTFabEnv(ParallelEnv):
                     old_pos = prev_positions[agent]
                     old_target = self.agent_targets[agent]
 
-                    # 이동 전 거리
-                    try:
-                        old_dist = nx.shortest_path_length(self.graph, old_pos, old_target)
-                    except nx.NetworkXNoPath:
-                        old_dist = 100
+                    old_dist = self._get_shortest_dist(old_pos, old_target)
 
                     self.agent_positions[agent] = next_pos
 
-                    # 이동 후 거리
-                    try:
-                        new_dist = nx.shortest_path_length(self.graph, next_pos, old_target)
-                    except nx.NetworkXNoPath:
-                        new_dist = 100
+                    new_dist = self._get_shortest_dist(next_pos, old_target)
 
                     # 목적지에 가까워졌으면 작은 보상, 멀어졌으면 작은 페널티
                     if new_dist < old_dist:
-                        rewards[agent] += 0.2
+                        rewards[agent] += self.reward_config["progress_reward"]
                     elif new_dist > old_dist:
-                        rewards[agent] -= 0.2
+                        rewards[agent] += self.reward_config["regress_penalty"]
 
                     # 목적지 도착 이벤트 발생!
                     if next_pos == self.agent_targets[agent]:
                         # Hot Lot이면 더 큰 보상
-                        delivery_bonus = 50.0 if self.agent_priorities[agent] == 1 else 20.0
+                        delivery_bonus = (
+                            self.reward_config["hot_lot_delivery_reward"]
+                            if self.agent_priorities[agent] == 1
+                            else self.reward_config["normal_delivery_reward"]
+                        )
                         rewards[agent] += delivery_bonus
                         self.delivery_count += 1
+                        if self.agent_priorities[agent] == 1:
+                            self.hot_lot_delivery_count += 1
                         self.agent_states[agent] = 1
-                        self.loading_timers[agent] = 5
+                        self.loading_timers[agent] = self.reward_config["loading_steps"]
                 else:
-                    rewards[agent] -= 15.0 # 충돌 페널티 강화
+                    rewards[agent] += self.reward_config["collision_penalty"]
                     self.collision_count += 1
 
                 # 데드락(Stall) 카운터 업데이트
@@ -271,9 +325,9 @@ class OHTFabEnv(ParallelEnv):
                     self.stall_counters[agent] = 0
 
                 # 조기 종료(Truncation) 처리: 15스텝 이상 정체 시
-                if self.stall_counters[agent] >= 15:
+                if self.stall_counters[agent] >= self.reward_config["stall_threshold"]:
                     truncations[agent] = True
-                    rewards[agent] -= 50.0 # 데드락 페널티
+                    rewards[agent] += self.reward_config["stall_penalty"]
                     # 한 에이전트라도 데드락이면 episode 전체를 종료
                     for a in self.agents:
                         truncations[a] = True
@@ -282,6 +336,7 @@ class OHTFabEnv(ParallelEnv):
             obs[agent] = self._compute_single_obs(agent)
             infos[agent].update({
                 "delivery_count": self.delivery_count,
+                "hot_lot_delivery_count": self.hot_lot_delivery_count,
                 "collision_count": self.collision_count,
                 "invalid_action_count": self.invalid_action_count,
                 "current_step": self.current_step,
@@ -292,7 +347,13 @@ class OHTFabEnv(ParallelEnv):
         if self.current_step >= self.max_steps:
             for agent in self.agents:
                 truncations[agent] = True
-                
+
+        self.agents = [
+            agent
+            for agent in self.agents
+            if not (terminations.get(agent, False) or truncations.get(agent, False))
+        ]
+
         return obs, rewards, terminations, truncations, infos
 
     def render(self, step, action_dict=None, rewards=None):
