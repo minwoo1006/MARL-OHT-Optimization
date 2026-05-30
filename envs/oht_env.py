@@ -10,10 +10,12 @@ class OHTFabEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "oht_fab_v1"}
 
     def __init__(self, num_ohts=2, max_steps=200, scheduler=None, **map_kwargs):
-        # 수백 x 수백 스케일 지원 (기본 300x200)
+        # [BUG1 FIX] 기본값을 300x200 메가 팹에서 학습에 적합한 소형 맵으로 변경.
+        # 300x200 맵은 매 스텝 nx.shortest_path 호출 시 극심한 성능 저하를 유발함.
+        # 대형 맵이 필요하면 OHTFabEnv(..., width=300, height=200, bay_interval=30, bay_depth=20) 으로 명시적으로 전달.
         if not map_kwargs:
-            map_kwargs = {"width": 300, "height": 200, "bay_interval": 30, "bay_depth": 20}
-            
+            map_kwargs = {"width": 20, "height": 12, "bay_interval": 5, "bay_depth": 3}
+
         self.graph = create_fab_graph(layout_type="mega", **map_kwargs)
         self.num_ohts = num_ohts
         self.max_steps = max_steps
@@ -182,6 +184,10 @@ class OHTFabEnv(ParallelEnv):
                         # 작업이 없으면 제자리 대기 (목적지를 현재 위치로)
                         self.agent_targets[agent] = self.agent_positions[agent]
                         self.agent_priorities[agent] = 0
+                    # [BUG2 FIX] 텔레포트(새 작업 시작) 시 stall_counter 초기화.
+                    # 초기화하지 않으면 이전 에피소드에서 누적된 카운트가 유지된 채
+                    # 새 출발지에서 단 한 스텝만 멈춰도 데드락 판정이 날 수 있음.
+                    self.stall_counters[agent] = 0
                 continue # 로딩 중이면 아래의 이동(Action) 로직 생략
                 
             # [State 0: MOVING 중일 때] - 들어온 Action 처리
@@ -295,7 +301,12 @@ class OHTFabEnv(ParallelEnv):
                 
         return obs, rewards, terminations, truncations, infos
 
-    def render(self, step, action_dict=None, rewards=None):
+    def render(self, mode=None):
+        """PettingZoo / RLlib 표준 시그니처. RLlib이 인자 없이 자동 호출해도 crash 없음.
+        상세 디버그 출력이 필요하면 render_debug(step, action_dict, rewards) 를 직접 호출."""
+        self.render_debug(step=self.current_step)
+
+    def render_debug(self, step, action_dict=None, rewards=None):
         print(f"\n=== [Step {step}] OHT 팹 모니터링 (Mega-Fab Scale) ===")
         # 맵 크기에 맞게 그리드 동적 계산
         nodes = list(self.graph.nodes())

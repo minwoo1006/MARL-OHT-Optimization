@@ -11,6 +11,11 @@ import torch
 from ray.rllib.core.columns import Columns
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# [BUG1 FIX] 맵 크기를 한 곳에서 관리. 학습/평가 전 구간에 동일한 맵이 사용되도록 보장.
+# 대형 맵(300x200)은 매 스텝 nx.shortest_path 호출 비용이 폭증해 학습 불가.
+# 발표 전 대형 맵 테스트가 필요하면 아래 값만 바꾸면 모든 호출에 반영됨.
+TRAIN_MAP_KWARGS = {"width": 20, "height": 12, "bay_interval": 5, "bay_depth": 3}
+
 import ray
 from ray.tune.registry import register_env
 from ray.rllib.algorithms.ppo import PPOConfig
@@ -27,7 +32,7 @@ def env_creator(config):
     """
     num_ohts = config.get("num_ohts", 5)
     max_steps = config.get("max_steps", 200)
-    raw_env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps)
+    raw_env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps, **TRAIN_MAP_KWARGS)
     return ParallelPettingZooEnv(raw_env)
 
 
@@ -95,7 +100,7 @@ def evaluate_ppo_policy(algo, num_ohts=5, max_steps=200, num_episodes=5, render=
     episode_results = []
 
     for episode_idx in range(num_episodes):
-        env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps)
+        env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps, **TRAIN_MAP_KWARGS)
         obs, infos = env.reset()
         episode_return = 0.0
 
@@ -108,7 +113,7 @@ def evaluate_ppo_policy(algo, num_ohts=5, max_steps=200, num_episodes=5, render=
             obs, rewards, terminations, truncations, infos = env.step(action_dict)
             episode_return += sum(rewards.values())
             if render:
-                env.render(step=step + 1, action_dict=action_dict, rewards=rewards)
+                env.render_debug(step=step + 1, action_dict=action_dict, rewards=rewards)
             if all(terminations.values()) or all(truncations.values()):
                 break
 
@@ -162,7 +167,7 @@ def collect_congestion_data(
     rows = []
 
     for episode_idx in range(num_episodes):
-        env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps)
+        env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps, **TRAIN_MAP_KWARGS)
         obs, infos = env.reset()
 
         for step in range(max_steps):
@@ -245,7 +250,7 @@ def evaluate_random_policy(num_ohts=5, max_steps=200, num_episodes=5):
     episode_results = []
 
     for episode_idx in range(num_episodes):
-        env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps)
+        env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps, **TRAIN_MAP_KWARGS)
         obs, infos = env.reset()
         episode_return = 0.0
 
@@ -290,7 +295,7 @@ def evaluate_dijkstra_policy(num_ohts=5, max_steps=200, num_episodes=5):
     episode_results = []
 
     for episode_idx in range(num_episodes):
-        env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps)
+        env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps, **TRAIN_MAP_KWARGS)
         obs, infos = env.reset()
         dijkstra_agent = DijkstraBaselineAgent(env.graph)
         episode_return = 0.0
@@ -354,7 +359,7 @@ def main():
     ray.init(ignore_reinit_error=True)
     register_env("oht_fab_env", env_creator)
 
-    temp_env = OHTFabEnv(num_ohts=5, max_steps=200)
+    temp_env = OHTFabEnv(num_ohts=5, max_steps=200, **TRAIN_MAP_KWARGS)
     obs_space = temp_env.observation_space("oht_0")
     act_space = temp_env.action_space("oht_0")
 

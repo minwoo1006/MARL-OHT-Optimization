@@ -75,7 +75,9 @@ def run_dijkstra_baseline(env, max_steps: int = 500, verbose: bool = True, rende
     """
     Dijkstra 베이스라인으로 한 에피소드를 실행하고 성능 지표를 반환
     """
-    env.reset()
+    # [BUG4 FIX] reset()은 (obs, infos)를 반환하므로 올바르게 받아야 함.
+    # 반환값을 버리면 나중에 obs 기반 로직 추가 시 버그 발생 가능.
+    obs, infos = env.reset()
     agent = DijkstraBaselineAgent(env.graph)
 
     metrics = {
