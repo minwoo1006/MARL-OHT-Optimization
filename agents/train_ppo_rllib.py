@@ -4,6 +4,8 @@
 
 import os
 import sys
+import csv
+from pathlib import Path
 import numpy as np
 import torch
 from ray.rllib.core.columns import Columns
@@ -132,6 +134,111 @@ def evaluate_ppo_policy(algo, num_ohts=5, max_steps=200, num_episodes=5, render=
         "avg_episode_return": np.mean([r["episode_return"] for r in episode_results]),
     }
     return summary, episode_results
+
+
+
+def collect_congestion_data(
+    algo,
+    iteration,
+    num_ohts=5,
+    max_steps=200,
+    num_episodes=3,
+    csv_path="logs/congestion_data.csv",
+):
+    """
+    학습 중 현재 PPO 정책을 별도 평가 episode에서 실행하면서
+    정체(stall), 데드락, 충돌, 배송, Hot Lot 관련 데이터를 수집한다.
+
+    - W&B에는 요약 지표를 기록
+    - CSV에는 step별 정체 구간 데이터를 저장
+    """
+    stall_values = []
+    deadlock_events = 0
+    hotlot_active_values = []
+    delivery_counts = []
+    collision_counts = []
+    invalid_action_counts = []
+    episode_steps = []
+    rows = []
+
+    for episode_idx in range(num_episodes):
+        env = OHTFabEnv(num_ohts=num_ohts, max_steps=max_steps)
+        obs, infos = env.reset()
+
+        for step in range(max_steps):
+            action_dict = {}
+            for agent_id in env.agents:
+                action_dict[agent_id] = safe_compute_action(
+                    algo, obs[agent_id], env=env, agent_id=agent_id
+                )
+
+            obs, rewards, terminations, truncations, infos = env.step(action_dict)
+
+            active_hotlots_this_step = 0
+            for agent_id, info in infos.items():
+                stall = int(info.get("stall_count", 0))
+                is_hot_lot = int(info.get("is_hot_lot", 0))
+                delivery_count = int(info.get("delivery_count", 0))
+                collision_count = int(info.get("collision_count", 0))
+                invalid_action_count = int(info.get("invalid_action_count", 0))
+
+                stall_values.append(stall)
+                active_hotlots_this_step += is_hot_lot
+
+                if stall >= 15:
+                    deadlock_events += 1
+
+                # stall이 발생한 위치를 CSV로 저장해서 정체 구간 분석에 사용
+                if stall > 0:
+                    rows.append({
+                        "iteration": iteration + 1,
+                        "episode": episode_idx + 1,
+                        "step": step + 1,
+                        "agent_id": agent_id,
+                        "position": str(env.agent_positions.get(agent_id)),
+                        "target": str(env.agent_targets.get(agent_id)),
+                        "stall_count": stall,
+                        "is_hot_lot": is_hot_lot,
+                        "action": int(action_dict.get(agent_id, -1)),
+                        "reward": float(rewards.get(agent_id, 0.0)),
+                        "delivery_count": delivery_count,
+                        "collision_count": collision_count,
+                        "invalid_action_count": invalid_action_count,
+                    })
+
+            hotlot_active_values.append(active_hotlots_this_step)
+
+            if all(terminations.values()) or all(truncations.values()):
+                break
+
+        delivery_counts.append(env.delivery_count)
+        collision_counts.append(env.collision_count)
+        invalid_action_counts.append(env.invalid_action_count)
+        episode_steps.append(env.current_step)
+
+    # CSV 저장: 발표/분석용 정체 구간 raw data
+    if rows:
+        csv_path = Path(csv_path)
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        file_exists = csv_path.exists()
+        fieldnames = list(rows[0].keys())
+        with csv_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerows(rows)
+
+    return {
+        "avg_stall": float(np.mean(stall_values)) if stall_values else 0.0,
+        "max_stall": int(np.max(stall_values)) if stall_values else 0,
+        "deadlock_count": int(deadlock_events),
+        "avg_delivery_count": float(np.mean(delivery_counts)) if delivery_counts else 0.0,
+        "avg_collision_count": float(np.mean(collision_counts)) if collision_counts else 0.0,
+        "avg_invalid_action_count": float(np.mean(invalid_action_counts)) if invalid_action_counts else 0.0,
+        "avg_episode_step": float(np.mean(episode_steps)) if episode_steps else 0.0,
+        "avg_active_hotlot_count": float(np.mean(hotlot_active_values)) if hotlot_active_values else 0.0,
+        "stall_row_count": int(len(rows)),
+    }
 
 
 def evaluate_random_policy(num_ohts=5, max_steps=200, num_episodes=5):
@@ -281,6 +388,8 @@ def main():
         "train_batch":    1000,
         "gamma":          0.99,
         "num_iterations": 1000,
+        "congestion_log_interval": 10,
+        "congestion_eval_episodes": 3,
     })
 
     # =========================
@@ -294,6 +403,20 @@ def main():
 
         # ✅ [추가] 매 iteration W&B에 기록
         logger.log_train(i, result)
+
+        # ✅ [추가] 정체 구간 해소 데이터 수집 및 W&B 기록
+        # 매 10 iteration마다 현재 정책을 별도 평가 episode에서 실행하여
+        # stall/deadlock/throughput/collision/Hot Lot 관련 지표를 수집한다.
+        if (i + 1) % log_interval == 0 or i == 0:
+            congestion_data = collect_congestion_data(
+                algo,
+                iteration=i,
+                num_ohts=5,
+                max_steps=200,
+                num_episodes=3,
+                csv_path="logs/congestion_data.csv",
+            )
+            logger.log_congestion(i, congestion_data)
 
         env_runners = result.get("env_runners", {})
         episode_return_mean = env_runners.get("episode_return_mean")

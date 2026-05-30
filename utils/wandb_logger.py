@@ -125,6 +125,29 @@ class WandBLogger:
         else:
             print(f"  [W&B-console] STALL | iter={iteration+1} | {stall_data}")
 
+
+    def log_congestion(self, iteration: int, congestion_data: dict):
+        """
+        정체 구간 해소 관련 상세 지표를 W&B에 기록
+        """
+        log_dict = {
+            "stall/avg_stall_count": congestion_data.get("avg_stall"),
+            "stall/max_stall_count": congestion_data.get("max_stall"),
+            "stall/deadlock_count": congestion_data.get("deadlock_count"),
+            "stall/stall_row_count": congestion_data.get("stall_row_count"),
+            "traffic/avg_delivery_count": congestion_data.get("avg_delivery_count"),
+            "traffic/avg_collision_count": congestion_data.get("avg_collision_count"),
+            "traffic/avg_invalid_action_count": congestion_data.get("avg_invalid_action_count"),
+            "traffic/avg_episode_step": congestion_data.get("avg_episode_step"),
+            "hotlot/avg_active_hotlot_count": congestion_data.get("avg_active_hotlot_count"),
+        }
+        log_dict = {k: v for k, v in log_dict.items() if v is not None}
+
+        if self._enabled:
+            self._wandb.log(log_dict, step=iteration + 1)
+        else:
+            print(f"  [W&B-console] CONGESTION | iter={iteration+1} | {congestion_data}")
+
     def finish(self):
         """W&B 실행을 종료합니다."""
         if self._enabled:
