@@ -91,6 +91,13 @@ class WandBLogger:
             log_dict = {
                 f"{prefix}/avg_delivery_count": summary.get("avg_delivery_count"),
                 f"{prefix}/avg_hot_lot_delivery_count": summary.get("avg_hot_lot_delivery_count"),
+                f"{prefix}/avg_hot_lot_assigned_count": summary.get("avg_hot_lot_assigned_count"),
+                f"{prefix}/avg_hot_lot_completion_rate": summary.get("avg_hot_lot_completion_rate"),
+                f"{prefix}/avg_throughput": summary.get("avg_throughput"),
+                f"{prefix}/avg_cycle_time": summary.get("avg_cycle_time"),
+                f"{prefix}/avg_hot_lot_cycle_time": summary.get("avg_hot_lot_cycle_time"),
+                f"{prefix}/avg_hot_lot_yield_success_rate": summary.get("avg_hot_lot_yield_success_rate"),
+                f"{prefix}/avg_hot_lot_yield_opportunities": summary.get("avg_hot_lot_yield_opportunities"),
                 f"{prefix}/avg_collision_count": summary.get("avg_collision_count"),
                 f"{prefix}/avg_invalid_action": summary.get("avg_invalid_action_count"),
                 f"{prefix}/avg_episode_return": summary.get("avg_episode_return"),

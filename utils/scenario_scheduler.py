@@ -35,14 +35,29 @@ class ScenarioScheduler:
         self.task_queue = collections.deque(initial_tasks if initial_tasks else [])
         self.active_tasks = {}
 
-def create_default_scenario(ports, num_tasks=50):
+def create_default_scenario(
+    ports,
+    num_tasks=50,
+    unique_initial_starts=0,
+    hot_lot_probability=0.1,
+):
     """
     테스트를 위한 기본 시나리오 생성 (10% 확률로 Hot Lot 발생)
     """
     import random
+
     tasks = []
-    for _ in range(num_tasks):
-        start, goal = random.sample(ports, 2)
-        is_hot_lot = random.random() < 0.1
+    initial_count = min(unique_initial_starts, len(ports), num_tasks)
+    initial_starts = random.sample(ports, initial_count)
+
+    for start in initial_starts:
+        goal = random.choice([port for port in ports if port != start])
+        is_hot_lot = random.random() < hot_lot_probability
         tasks.append(Task(start, goal, is_hot_lot))
+
+    for _ in range(num_tasks - initial_count):
+        start, goal = random.sample(ports, 2)
+        is_hot_lot = random.random() < hot_lot_probability
+        tasks.append(Task(start, goal, is_hot_lot))
+
     return tasks

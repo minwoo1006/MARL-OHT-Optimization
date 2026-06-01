@@ -7,17 +7,21 @@ from envs.grid_map import create_fab_graph
 from utils.scenario_scheduler import ScenarioScheduler, create_default_scenario
 
 DEFAULT_REWARD_CONFIG = {
-    "wait_penalty": -0.1,
+    "wait_penalty": -0.3,
     "invalid_action_penalty": -0.1,
-    "move_penalty": -0.1,
-    "yield_reward": 0.05,
-    "hot_lot_yield_reward": 2.0,
+    "move_penalty": -0.03,
+    "yield_reward": 0.0,
+    "hot_lot_yield_reward": 0.3,
     "progress_reward": 0.2,
+    "hot_lot_progress_reward": 0.8,
     "regress_penalty": -0.2,
-    "normal_delivery_reward": 20.0,
-    "hot_lot_delivery_reward": 50.0,
-    "collision_penalty": -15.0,
-    "stall_penalty": -50.0,
+    "normal_delivery_reward": 25.0,
+    "hot_lot_delivery_reward": 160.0,
+    "collision_penalty": -80.0,
+    "stall_penalty": -80.0,
+    "hot_lot_blocking_penalty": -1.0,
+    "no_delivery_step_penalty": -0.05,
+    "terminate_on_collision": 0,
     "stall_threshold": 15,
     "loading_steps": 5,
 }
@@ -26,7 +30,16 @@ DEFAULT_REWARD_CONFIG = {
 class OHTFabEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "oht_fab_v1"}
 
-    def __init__(self, num_ohts=2, max_steps=200, scheduler=None, reward_config=None, **map_kwargs):
+    def __init__(
+        self,
+        num_ohts=2,
+        max_steps=200,
+        scheduler=None,
+        reward_config=None,
+        hot_lot_probability=0.1,
+        initial_tasks=None,
+        **map_kwargs,
+    ):
         # 수백 x 수백 스케일 지원 (기본 300x200)
         if not map_kwargs:
             map_kwargs = {"width": 300, "height": 200, "bay_interval": 30, "bay_depth": 20}
@@ -37,11 +50,18 @@ class OHTFabEnv(ParallelEnv):
         self.max_steps = max_steps
         self.current_step = 0
         self.reward_config = {**DEFAULT_REWARD_CONFIG, **(reward_config or {})}
+        self.hot_lot_probability = hot_lot_probability
+        self.initial_tasks = list(initial_tasks) if initial_tasks is not None else None
         
         # [MES 연동] 시나리오 스케줄러 설정
         self.scheduler = scheduler
         if self.scheduler is None:
-            tasks = create_default_scenario(self.port_nodes, num_tasks=max_steps * num_ohts)
+            tasks = create_default_scenario(
+                self.port_nodes,
+                num_tasks=max_steps * num_ohts,
+                unique_initial_starts=num_ohts,
+                hot_lot_probability=self.hot_lot_probability,
+            )
             self.scheduler = ScenarioScheduler(tasks)
 
         # [PettingZoo 규격] 에이전트 이름 리스트
@@ -60,12 +80,19 @@ class OHTFabEnv(ParallelEnv):
         self.agent_positions = {}
         self.agent_targets = {}
         self.agent_priorities = {} # Hot Lot 여부 (0: 일반, 1: Hot Lot)
+        self.agent_best_dists = {}
         self.cumulative_rewards = {}
         self.stall_counters = {} # 데드락 감지용 카운터
         self.delivery_count = 0
         self.hot_lot_delivery_count = 0
+        self.hot_lot_assigned_count = 0
         self.collision_count = 0
         self.invalid_action_count = 0
+        self.task_start_steps = {}
+        self.completed_cycle_times = []
+        self.hot_lot_cycle_times = []
+        self.hot_lot_yield_opportunities = 0
+        self.hot_lot_yield_successes = 0
         
         # [State Transition] 상태 및 타이머 변수 추가
         self.agent_states = {}   # 0: 이동 중(MOVING), 1: 상하차 중(LOADING)
@@ -110,6 +137,49 @@ class OHTFabEnv(ParallelEnv):
             return None
         return min(candidates, key=lambda item: item[0])[1]
 
+    def _has_rear_hot_lot(self, agent):
+        curr_node = self.agent_positions[agent]
+        for pred in self.predecessors_cache[curr_node]:
+            for other in self.agents:
+                if other == agent:
+                    continue
+                if self.agent_positions[other] == pred and self.agent_priorities[other] == 1:
+                    return True
+        return False
+
+    def get_episode_metrics(self):
+        steps = max(self.current_step, 1)
+        avg_cycle_time = (
+            float(np.mean(self.completed_cycle_times))
+            if self.completed_cycle_times
+            else 0.0
+        )
+        avg_hot_lot_cycle_time = (
+            float(np.mean(self.hot_lot_cycle_times))
+            if self.hot_lot_cycle_times
+            else 0.0
+        )
+        hot_lot_yield_success_rate = (
+            self.hot_lot_yield_successes / self.hot_lot_yield_opportunities
+            if self.hot_lot_yield_opportunities
+            else 0.0
+        )
+        hot_lot_completion_rate = (
+            self.hot_lot_delivery_count / self.hot_lot_assigned_count
+            if self.hot_lot_assigned_count
+            else 0.0
+        )
+        return {
+            "throughput": self.delivery_count / steps,
+            "avg_cycle_time": avg_cycle_time,
+            "avg_hot_lot_cycle_time": avg_hot_lot_cycle_time,
+            "hot_lot_assigned_count": self.hot_lot_assigned_count,
+            "hot_lot_completion_rate": hot_lot_completion_rate,
+            "hot_lot_yield_opportunities": self.hot_lot_yield_opportunities,
+            "hot_lot_yield_successes": self.hot_lot_yield_successes,
+            "hot_lot_yield_success_rate": hot_lot_yield_success_rate,
+        }
+
     def observation_space(self, agent):
         return self.observation_spaces[agent]
 
@@ -121,11 +191,25 @@ class OHTFabEnv(ParallelEnv):
         self.current_step = 0
         self.delivery_count = 0
         self.hot_lot_delivery_count = 0
+        self.hot_lot_assigned_count = 0
         self.collision_count = 0
         self.invalid_action_count = 0
+        self.task_start_steps = {}
+        self.completed_cycle_times = []
+        self.hot_lot_cycle_times = []
+        self.hot_lot_yield_opportunities = 0
+        self.hot_lot_yield_successes = 0
         
         # 스케줄러 초기화
-        tasks = create_default_scenario(self.port_nodes, num_tasks=self.max_steps * self.num_ohts)
+        if self.initial_tasks is not None:
+            tasks = list(self.initial_tasks)
+        else:
+            tasks = create_default_scenario(
+                self.port_nodes,
+                num_tasks=self.max_steps * self.num_ohts,
+                unique_initial_starts=self.num_ohts,
+                hot_lot_probability=self.hot_lot_probability,
+            )
         self.scheduler.reset(tasks)
 
         for i, agent in enumerate(self.agents):
@@ -134,10 +218,16 @@ class OHTFabEnv(ParallelEnv):
                 self.agent_positions[agent] = task.start_node
                 self.agent_targets[agent] = task.goal_node
                 self.agent_priorities[agent] = 1 if task.is_hot_lot else 0
+                if task.is_hot_lot:
+                    self.hot_lot_assigned_count += 1
+                self.task_start_steps[agent] = self.current_step
+                self.agent_best_dists[agent] = self._get_shortest_dist(task.start_node, task.goal_node)
             else:
                 self.agent_positions[agent] = random.choice(self.port_nodes)
                 self.agent_targets[agent] = self.agent_positions[agent]
                 self.agent_priorities[agent] = 0
+                self.task_start_steps.pop(agent, None)
+                self.agent_best_dists[agent] = 0
 
             self.cumulative_rewards[agent] = 0.0
             self.stall_counters[agent] = 0
@@ -230,46 +320,38 @@ class OHTFabEnv(ParallelEnv):
                         self.agent_positions[agent] = task.start_node
                         self.agent_targets[agent] = task.goal_node
                         self.agent_priorities[agent] = 1 if task.is_hot_lot else 0
+                        if task.is_hot_lot:
+                            self.hot_lot_assigned_count += 1
+                        self.task_start_steps[agent] = self.current_step
+                        self.agent_best_dists[agent] = self._get_shortest_dist(task.start_node, task.goal_node)
                     else:
                         # 작업이 없으면 제자리 대기 (목적지를 현재 위치로)
                         self.agent_targets[agent] = self.agent_positions[agent]
                         self.agent_priorities[agent] = 0
+                        self.task_start_steps.pop(agent, None)
+                        self.agent_best_dists[agent] = 0
                 continue # 로딩 중이면 아래의 이동(Action) 로직 생략
                 
             # [State 0: MOVING 중일 때] - 들어온 Action 처리
             action = action_dict.get(agent, 0)
             curr_node = self.agent_positions[agent]
             neighbors = self.successors_cache[curr_node]
+            has_rear_hot_lot = self.agent_priorities[agent] == 0 and self._has_rear_hot_lot(agent)
+            if has_rear_hot_lot:
+                self.hot_lot_yield_opportunities += 1
+                if action > 0 and action <= len(neighbors):
+                    self.hot_lot_yield_successes += 1
             
             if action == 0:
                 intended_positions[agent] = curr_node
-                
-                # [Yielding Reward] 주변에 Hot Lot이 있는데 양보했다면 큰 보너스
-                is_yielding_for_hot_lot = False
-                for other in self.agents:
-                    if other != agent and self.agent_priorities[other] == 1:
-                        # 내 다음 갈 수 있는 노드에 Hot Lot이 있다면
-                        if self.agent_positions[other] in neighbors:
-                            is_yielding_for_hot_lot = True
-                            break
-                
-                if is_yielding_for_hot_lot:
-                    rewards[agent] = self.reward_config["hot_lot_yield_reward"]
-                else:
-                    # 일반 양보 보상 체크
-                    others_nearby = False
-                    for other in self.agents:
-                        if other != agent and self.agent_positions[other] in neighbors:
-                            others_nearby = True
-                            break
-                    rewards[agent] = (
-                        self.reward_config["yield_reward"]
-                        if others_nearby
-                        else self.reward_config["wait_penalty"]
-                    )
+                rewards[agent] = self.reward_config["wait_penalty"]
+                if has_rear_hot_lot:
+                    rewards[agent] += self.reward_config["hot_lot_blocking_penalty"]
             elif action > 0 and action <= len(neighbors):
                 intended_positions[agent] = neighbors[action - 1]
                 rewards[agent] = self.reward_config["move_penalty"]
+                if has_rear_hot_lot:
+                    rewards[agent] += self.reward_config["hot_lot_yield_reward"]
             else:
                 intended_positions[agent] = curr_node
                 rewards[agent] = self.reward_config["invalid_action_penalty"]
@@ -294,14 +376,23 @@ class OHTFabEnv(ParallelEnv):
 
                     new_dist = self._get_shortest_dist(next_pos, old_target)
 
-                    # 목적지에 가까워졌으면 작은 보상, 멀어졌으면 작은 페널티
-                    if new_dist < old_dist:
-                        rewards[agent] += self.reward_config["progress_reward"]
+                    # Task 기준 최단 거리 기록을 갱신했을 때만 progress reward를 준다.
+                    # 이렇게 해야 delivery 없이 progress reward만 반복 수확하는 패턴을 줄일 수 있다.
+                    best_dist = self.agent_best_dists.get(agent, old_dist)
+                    if new_dist < best_dist:
+                        rewards[agent] += (
+                            self.reward_config["hot_lot_progress_reward"]
+                            if self.agent_priorities[agent] == 1
+                            else self.reward_config["progress_reward"]
+                        )
+                        self.agent_best_dists[agent] = new_dist
                     elif new_dist > old_dist:
                         rewards[agent] += self.reward_config["regress_penalty"]
+                    elif next_pos == old_pos:
+                        rewards[agent] += self.reward_config["no_delivery_step_penalty"]
 
                     # 목적지 도착 이벤트 발생!
-                    if next_pos == self.agent_targets[agent]:
+                    if next_pos == self.agent_targets[agent] and agent in self.task_start_steps:
                         # Hot Lot이면 더 큰 보상
                         delivery_bonus = (
                             self.reward_config["hot_lot_delivery_reward"]
@@ -310,13 +401,19 @@ class OHTFabEnv(ParallelEnv):
                         )
                         rewards[agent] += delivery_bonus
                         self.delivery_count += 1
+                        cycle_time = self.current_step - self.task_start_steps.get(agent, self.current_step)
+                        self.completed_cycle_times.append(cycle_time)
                         if self.agent_priorities[agent] == 1:
                             self.hot_lot_delivery_count += 1
+                            self.hot_lot_cycle_times.append(cycle_time)
                         self.agent_states[agent] = 1
                         self.loading_timers[agent] = self.reward_config["loading_steps"]
                 else:
                     rewards[agent] += self.reward_config["collision_penalty"]
                     self.collision_count += 1
+                    if self.reward_config["terminate_on_collision"]:
+                        for a in self.agents:
+                            truncations[a] = True
 
                 # 데드락(Stall) 카운터 업데이트
                 if self.agent_positions[agent] == prev_positions[agent]:
@@ -341,7 +438,8 @@ class OHTFabEnv(ParallelEnv):
                 "invalid_action_count": self.invalid_action_count,
                 "current_step": self.current_step,
                 "stall_count": self.stall_counters[agent],
-                "is_hot_lot": self.agent_priorities[agent] # 인터페이스 정의
+                "is_hot_lot": self.agent_priorities[agent], # 인터페이스 정의
+                **self.get_episode_metrics(),
             })
 
         if self.current_step >= self.max_steps:
