@@ -6,26 +6,63 @@ from gymnasium.spaces import Discrete, Box
 from envs.grid_map import create_fab_graph
 from utils.scenario_scheduler import ScenarioScheduler, create_default_scenario
 
+DEFAULT_REWARD_CONFIG = {
+    "wait_penalty": -0.3,
+    "invalid_action_penalty": -0.1,
+    "move_penalty": -0.03,
+    "yield_reward": 0.0,
+    "hot_lot_yield_reward": 0.3,
+    "progress_reward": 0.2,
+    "hot_lot_progress_reward": 0.8,
+    "regress_penalty": -0.2,
+    "normal_delivery_reward": 25.0,
+    "hot_lot_delivery_reward": 160.0,
+    "collision_penalty": -80.0,
+    "stall_penalty": -80.0,
+    "hot_lot_blocking_penalty": -1.0,
+    "no_delivery_step_penalty": -0.05,
+    "terminate_on_collision": 0,
+    "stall_threshold": 15,
+    "loading_steps": 5,
+}
+
+
 class OHTFabEnv(ParallelEnv):
     metadata = {'render_modes': ['human'], "name": "oht_fab_v1"}
 
-    def __init__(self, num_ohts=2, max_steps=200, scheduler=None, **map_kwargs):
-        # [BUG1 FIX] 기본값을 300x200 메가 팹에서 학습에 적합한 소형 맵으로 변경.
-        # 300x200 맵은 매 스텝 nx.shortest_path 호출 시 극심한 성능 저하를 유발함.
-        # 대형 맵이 필요하면 OHTFabEnv(..., width=300, height=200, bay_interval=30, bay_depth=20) 으로 명시적으로 전달.
+    def __init__(
+        self,
+        num_ohts=2,
+        max_steps=200,
+        scheduler=None,
+        reward_config=None,
+        hot_lot_probability=0.1,
+        initial_tasks=None,
+        **map_kwargs,
+    ):
+        # Keep the implicit default small enough for training; large maps are
+        # still supported by passing width/height/bay_* explicitly.
         if not map_kwargs:
             map_kwargs = {"width": 20, "height": 12, "bay_interval": 5, "bay_depth": 3}
 
         self.graph = create_fab_graph(layout_type="mega", **map_kwargs)
+        self._init_graph_caches()
         self.num_ohts = num_ohts
         self.max_steps = max_steps
         self.current_step = 0
+        self.reward_config = {**DEFAULT_REWARD_CONFIG, **(reward_config or {})}
+        self.hot_lot_probability = hot_lot_probability
+        self.initial_tasks = list(initial_tasks) if initial_tasks is not None else None
         
         # [MES 연동] 시나리오 스케줄러 설정
         self.scheduler = scheduler
         if self.scheduler is None:
-            ports = [n for n, d in self.graph.nodes(data=True) if d.get('is_port')]
-            tasks = create_default_scenario(ports, num_tasks=max_steps * num_ohts)
+            tasks = create_default_scenario(
+                self.port_nodes,
+                num_tasks=max_steps * num_ohts,
+                unique_initial_starts=num_ohts,
+                hot_lot_probability=self.hot_lot_probability,
+            )
             self.scheduler = ScenarioScheduler(tasks)
 
         # [PettingZoo 규격] 에이전트 이름 리스트
@@ -44,15 +81,106 @@ class OHTFabEnv(ParallelEnv):
         self.agent_positions = {}
         self.agent_targets = {}
         self.agent_priorities = {} # Hot Lot 여부 (0: 일반, 1: Hot Lot)
+        self.agent_best_dists = {}
         self.cumulative_rewards = {}
         self.stall_counters = {} # 데드락 감지용 카운터
         self.delivery_count = 0
+        self.hot_lot_delivery_count = 0
+        self.hot_lot_assigned_count = 0
         self.collision_count = 0
         self.invalid_action_count = 0
+        self.task_start_steps = {}
+        self.completed_cycle_times = []
+        self.hot_lot_cycle_times = []
+        self.hot_lot_yield_opportunities = 0
+        self.hot_lot_yield_successes = 0
         
         # [State Transition] 상태 및 타이머 변수 추가
         self.agent_states = {}   # 0: 이동 중(MOVING), 1: 상하차 중(LOADING)
         self.loading_timers = {} # 상하차 남은 스텝 수
+
+    def _init_graph_caches(self):
+        self.node_count = len(self.graph.nodes)
+        self.port_nodes = [n for n, d in self.graph.nodes(data=True) if d.get('is_port')]
+        self.successors_cache = {
+            node: list(self.graph.successors(node))
+            for node in self.graph.nodes
+        }
+        self.predecessors_cache = {
+            node: list(self.graph.predecessors(node))
+            for node in self.graph.nodes
+        }
+        self.reverse_graph = self.graph.reverse(copy=False)
+        self.shortest_dist = {}
+
+    def _get_dist_map_to_target(self, target):
+        if target not in self.shortest_dist:
+            self.shortest_dist[target] = nx.single_source_shortest_path_length(
+                self.reverse_graph,
+                target,
+            )
+        return self.shortest_dist[target]
+
+    def _get_shortest_dist(self, source, target):
+        return self._get_dist_map_to_target(target).get(source, 100)
+
+    def _get_next_hop(self, source, target):
+        if source == target:
+            return None
+
+        dist_map = self._get_dist_map_to_target(target)
+        candidates = [
+            (dist_map[next_node], next_node)
+            for next_node in self.successors_cache[source]
+            if next_node in dist_map
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _has_rear_hot_lot(self, agent):
+        curr_node = self.agent_positions[agent]
+        for pred in self.predecessors_cache[curr_node]:
+            for other in self.agents:
+                if other == agent:
+                    continue
+                if self.agent_positions[other] == pred and self.agent_priorities[other] == 1:
+                    return True
+        return False
+
+    def get_episode_metrics(self):
+        steps = max(self.current_step, 1)
+        avg_cycle_time = (
+            float(np.mean(self.completed_cycle_times))
+            if self.completed_cycle_times
+            else 0.0
+        )
+        avg_hot_lot_cycle_time = (
+            float(np.mean(self.hot_lot_cycle_times))
+            if self.hot_lot_cycle_times
+            else 0.0
+        )
+        hot_lot_yield_success_rate = (
+            self.hot_lot_yield_successes / self.hot_lot_yield_opportunities
+            if self.hot_lot_yield_opportunities
+            else 0.0
+        )
+        hot_lot_completion_rate = (
+            self.hot_lot_delivery_count / self.hot_lot_assigned_count
+            if self.hot_lot_assigned_count
+            else 0.0
+        )
+        return {
+            "throughput": self.delivery_count / steps,
+            "avg_cycle_time": avg_cycle_time,
+            "avg_hot_lot_cycle_time": avg_hot_lot_cycle_time,
+            "hot_lot_assigned_count": self.hot_lot_assigned_count,
+            "hot_lot_completion_rate": hot_lot_completion_rate,
+            "hot_lot_yield_opportunities": self.hot_lot_yield_opportunities,
+            "hot_lot_yield_successes": self.hot_lot_yield_successes,
+            "hot_lot_yield_success_rate": hot_lot_yield_success_rate,
+        }
+
     def observation_space(self, agent):
         return self.observation_spaces[agent]
 
@@ -63,12 +191,26 @@ class OHTFabEnv(ParallelEnv):
         self.agents = self.possible_agents[:]
         self.current_step = 0
         self.delivery_count = 0
+        self.hot_lot_delivery_count = 0
+        self.hot_lot_assigned_count = 0
         self.collision_count = 0
         self.invalid_action_count = 0
+        self.task_start_steps = {}
+        self.completed_cycle_times = []
+        self.hot_lot_cycle_times = []
+        self.hot_lot_yield_opportunities = 0
+        self.hot_lot_yield_successes = 0
         
         # 스케줄러 초기화
-        ports = [n for n, d in self.graph.nodes(data=True) if d.get('is_port')]
-        tasks = create_default_scenario(ports, num_tasks=self.max_steps * self.num_ohts)
+        if self.initial_tasks is not None:
+            tasks = list(self.initial_tasks)
+        else:
+            tasks = create_default_scenario(
+                self.port_nodes,
+                num_tasks=self.max_steps * self.num_ohts,
+                unique_initial_starts=self.num_ohts,
+                hot_lot_probability=self.hot_lot_probability,
+            )
         self.scheduler.reset(tasks)
 
         for i, agent in enumerate(self.agents):
@@ -77,10 +219,16 @@ class OHTFabEnv(ParallelEnv):
                 self.agent_positions[agent] = task.start_node
                 self.agent_targets[agent] = task.goal_node
                 self.agent_priorities[agent] = 1 if task.is_hot_lot else 0
+                if task.is_hot_lot:
+                    self.hot_lot_assigned_count += 1
+                self.task_start_steps[agent] = self.current_step
+                self.agent_best_dists[agent] = self._get_shortest_dist(task.start_node, task.goal_node)
             else:
-                self.agent_positions[agent] = random.choice(ports)
+                self.agent_positions[agent] = random.choice(self.port_nodes)
                 self.agent_targets[agent] = self.agent_positions[agent]
                 self.agent_priorities[agent] = 0
+                self.task_start_steps.pop(agent, None)
+                self.agent_best_dists[agent] = 0
 
             self.cumulative_rewards[agent] = 0.0
             self.stall_counters[agent] = 0
@@ -100,10 +248,7 @@ class OHTFabEnv(ParallelEnv):
         target_node = self.agent_targets[agent]
         
         # 1. 목적지 거리 정규화
-        try:
-            dist = nx.shortest_path_length(self.graph, curr_node, target_node)
-        except nx.NetworkXNoPath:
-            dist = 100
+        dist = self._get_shortest_dist(curr_node, target_node)
         norm_dist = min(dist / 100.0, 1.0) # 고정값으로 정규화 (맵 확장 대비)
         
         # 2. 나의 로딩 상태
@@ -111,20 +256,16 @@ class OHTFabEnv(ParallelEnv):
         
         # 3 & 4. 전방 거리 및 앞차 상태
         forward_dist, forward_state = 1.0, 0.0
-        try:
-            path = nx.shortest_path(self.graph, curr_node, target_node)
-            if len(path) > 1:
-                next_node = path[1]
-                for other_agent in self.agents:
-                    if other_agent != agent and self.agent_positions[other_agent] == next_node:
-                        forward_dist = 0.0
-                        forward_state = float(self.agent_states[other_agent])
-                        break
-        except nx.NetworkXNoPath:
-            pass
+        next_node = self._get_next_hop(curr_node, target_node)
+        if next_node is not None:
+            for other_agent in self.agents:
+                if other_agent != agent and self.agent_positions[other_agent] == next_node:
+                    forward_dist = 0.0
+                    forward_state = float(self.agent_states[other_agent])
+                    break
 
         # 5 & 6. 갈림길 정체도 (Spine-and-Bay 구조 기반)
-        neighbors = list(self.graph.successors(curr_node))
+        neighbors = self.successors_cache[curr_node]
         branch_a_cong, branch_b_cong = 0.0, 0.0
         if len(neighbors) > 0:
             for other_agent in self.agents:
@@ -141,7 +282,7 @@ class OHTFabEnv(ParallelEnv):
         rear_hot_lot_present = 0.0
         
         # 나를 향해 오는 노드들(Predecessors) 탐색
-        preds = list(self.graph.predecessors(curr_node))
+        preds = self.predecessors_cache[curr_node]
         for p in preds:
             for other in self.agents:
                 if other != agent and self.agent_positions[other] == p:
@@ -180,49 +321,42 @@ class OHTFabEnv(ParallelEnv):
                         self.agent_positions[agent] = task.start_node
                         self.agent_targets[agent] = task.goal_node
                         self.agent_priorities[agent] = 1 if task.is_hot_lot else 0
+                        if task.is_hot_lot:
+                            self.hot_lot_assigned_count += 1
+                        self.task_start_steps[agent] = self.current_step
+                        self.agent_best_dists[agent] = self._get_shortest_dist(task.start_node, task.goal_node)
                     else:
                         # 작업이 없으면 제자리 대기 (목적지를 현재 위치로)
                         self.agent_targets[agent] = self.agent_positions[agent]
                         self.agent_priorities[agent] = 0
-                    # [BUG2 FIX] 텔레포트(새 작업 시작) 시 stall_counter 초기화.
-                    # 초기화하지 않으면 이전 에피소드에서 누적된 카운트가 유지된 채
-                    # 새 출발지에서 단 한 스텝만 멈춰도 데드락 판정이 날 수 있음.
+                        self.task_start_steps.pop(agent, None)
+                        self.agent_best_dists[agent] = 0
                     self.stall_counters[agent] = 0
                 continue # 로딩 중이면 아래의 이동(Action) 로직 생략
                 
             # [State 0: MOVING 중일 때] - 들어온 Action 처리
             action = action_dict.get(agent, 0)
             curr_node = self.agent_positions[agent]
-            neighbors = list(self.graph.successors(curr_node))
+            neighbors = self.successors_cache[curr_node]
+            has_rear_hot_lot = self.agent_priorities[agent] == 0 and self._has_rear_hot_lot(agent)
+            if has_rear_hot_lot:
+                self.hot_lot_yield_opportunities += 1
+                if action > 0 and action <= len(neighbors):
+                    self.hot_lot_yield_successes += 1
             
             if action == 0:
                 intended_positions[agent] = curr_node
-                
-                # [Yielding Reward] 주변에 Hot Lot이 있는데 양보했다면 큰 보너스
-                is_yielding_for_hot_lot = False
-                for other in self.agents:
-                    if other != agent and self.agent_priorities[other] == 1:
-                        # 내 다음 갈 수 있는 노드에 Hot Lot이 있다면
-                        if self.agent_positions[other] in neighbors:
-                            is_yielding_for_hot_lot = True
-                            break
-                
-                if is_yielding_for_hot_lot:
-                    rewards[agent] = 2.0 # 적극적 양보 보상
-                else:
-                    # 일반 양보 보상 체크
-                    others_nearby = False
-                    for other in self.agents:
-                        if other != agent and self.agent_positions[other] in neighbors:
-                            others_nearby = True
-                            break
-                    rewards[agent] = 0.05 if others_nearby else -0.1
+                rewards[agent] = self.reward_config["wait_penalty"]
+                if has_rear_hot_lot:
+                    rewards[agent] += self.reward_config["hot_lot_blocking_penalty"]
             elif action > 0 and action <= len(neighbors):
                 intended_positions[agent] = neighbors[action - 1]
-                rewards[agent] = -0.1
+                rewards[agent] = self.reward_config["move_penalty"]
+                if has_rear_hot_lot:
+                    rewards[agent] += self.reward_config["hot_lot_yield_reward"]
             else:
                 intended_positions[agent] = curr_node
-                rewards[agent] = -1.0 # 에러 페널티
+                rewards[agent] = self.reward_config["invalid_action_penalty"]
                 self.invalid_action_count += 1
                 
         # 2. 충돌 감지 (모션 체크)
@@ -238,37 +372,50 @@ class OHTFabEnv(ParallelEnv):
                     old_pos = prev_positions[agent]
                     old_target = self.agent_targets[agent]
 
-                    # 이동 전 거리
-                    try:
-                        old_dist = nx.shortest_path_length(self.graph, old_pos, old_target)
-                    except nx.NetworkXNoPath:
-                        old_dist = 100
+                    old_dist = self._get_shortest_dist(old_pos, old_target)
 
                     self.agent_positions[agent] = next_pos
 
-                    # 이동 후 거리
-                    try:
-                        new_dist = nx.shortest_path_length(self.graph, next_pos, old_target)
-                    except nx.NetworkXNoPath:
-                        new_dist = 100
+                    new_dist = self._get_shortest_dist(next_pos, old_target)
 
-                    # 목적지에 가까워졌으면 작은 보상, 멀어졌으면 작은 페널티
-                    if new_dist < old_dist:
-                        rewards[agent] += 0.2
+                    # Task 기준 최단 거리 기록을 갱신했을 때만 progress reward를 준다.
+                    # 이렇게 해야 delivery 없이 progress reward만 반복 수확하는 패턴을 줄일 수 있다.
+                    best_dist = self.agent_best_dists.get(agent, old_dist)
+                    if new_dist < best_dist:
+                        rewards[agent] += (
+                            self.reward_config["hot_lot_progress_reward"]
+                            if self.agent_priorities[agent] == 1
+                            else self.reward_config["progress_reward"]
+                        )
+                        self.agent_best_dists[agent] = new_dist
                     elif new_dist > old_dist:
-                        rewards[agent] -= 0.2
+                        rewards[agent] += self.reward_config["regress_penalty"]
+                    elif next_pos == old_pos:
+                        rewards[agent] += self.reward_config["no_delivery_step_penalty"]
 
                     # 목적지 도착 이벤트 발생!
-                    if next_pos == self.agent_targets[agent]:
+                    if next_pos == self.agent_targets[agent] and agent in self.task_start_steps:
                         # Hot Lot이면 더 큰 보상
-                        delivery_bonus = 50.0 if self.agent_priorities[agent] == 1 else 20.0
+                        delivery_bonus = (
+                            self.reward_config["hot_lot_delivery_reward"]
+                            if self.agent_priorities[agent] == 1
+                            else self.reward_config["normal_delivery_reward"]
+                        )
                         rewards[agent] += delivery_bonus
                         self.delivery_count += 1
+                        cycle_time = self.current_step - self.task_start_steps.get(agent, self.current_step)
+                        self.completed_cycle_times.append(cycle_time)
+                        if self.agent_priorities[agent] == 1:
+                            self.hot_lot_delivery_count += 1
+                            self.hot_lot_cycle_times.append(cycle_time)
                         self.agent_states[agent] = 1
-                        self.loading_timers[agent] = 5
+                        self.loading_timers[agent] = self.reward_config["loading_steps"]
                 else:
-                    rewards[agent] -= 15.0 # 충돌 페널티 강화
+                    rewards[agent] += self.reward_config["collision_penalty"]
                     self.collision_count += 1
+                    if self.reward_config["terminate_on_collision"]:
+                        for a in self.agents:
+                            truncations[a] = True
 
                 # 데드락(Stall) 카운터 업데이트
                 if self.agent_positions[agent] == prev_positions[agent]:
@@ -277,9 +424,9 @@ class OHTFabEnv(ParallelEnv):
                     self.stall_counters[agent] = 0
 
                 # 조기 종료(Truncation) 처리: 15스텝 이상 정체 시
-                if self.stall_counters[agent] >= 15:
+                if self.stall_counters[agent] >= self.reward_config["stall_threshold"]:
                     truncations[agent] = True
-                    rewards[agent] -= 50.0 # 데드락 페널티
+                    rewards[agent] += self.reward_config["stall_penalty"]
                     # 한 에이전트라도 데드락이면 episode 전체를 종료
                     for a in self.agents:
                         truncations[a] = True
@@ -288,25 +435,30 @@ class OHTFabEnv(ParallelEnv):
             obs[agent] = self._compute_single_obs(agent)
             infos[agent].update({
                 "delivery_count": self.delivery_count,
+                "hot_lot_delivery_count": self.hot_lot_delivery_count,
                 "collision_count": self.collision_count,
                 "invalid_action_count": self.invalid_action_count,
                 "current_step": self.current_step,
                 "stall_count": self.stall_counters[agent],
-                "is_hot_lot": self.agent_priorities[agent] # 인터페이스 정의
+                "is_hot_lot": self.agent_priorities[agent], # 인터페이스 정의
+                **self.get_episode_metrics(),
             })
 
         if self.current_step >= self.max_steps:
             for agent in self.agents:
                 truncations[agent] = True
-                
+
+        self.agents = [
+            agent
+            for agent in self.agents
+            if not (terminations.get(agent, False) or truncations.get(agent, False))
+        ]
+
         return obs, rewards, terminations, truncations, infos
 
-    def render(self, mode=None):
-        """PettingZoo / RLlib 표준 시그니처. RLlib이 인자 없이 자동 호출해도 crash 없음.
-        상세 디버그 출력이 필요하면 render_debug(step, action_dict, rewards) 를 직접 호출."""
-        self.render_debug(step=self.current_step)
-
-    def render_debug(self, step, action_dict=None, rewards=None):
+    def render(self, step=None, action_dict=None, rewards=None, mode=None):
+        if step is None:
+            step = self.current_step
         print(f"\n=== [Step {step}] OHT 팹 모니터링 (Mega-Fab Scale) ===")
         # 맵 크기에 맞게 그리드 동적 계산
         nodes = list(self.graph.nodes())
