@@ -3,6 +3,9 @@
     SPACE  : 일시정지 / 재개
     →      : 일시정지 중 다음 프레임
     ←      : 일시정지 중 이전 프레임 (스냅샷 기반)
+    Mouse  : 드래그로 화면 이동, 휠로 확대/축소
+    + / -  : 확대 / 축소
+    F      : 전체 맵 맞춤
     R      : 녹화 시작 / 중지
     ESC    : 종료
 """
@@ -134,6 +137,59 @@ class OHTVisualizer:
         # [6] 녹화
         self._recording  = False
         self._frame_idx  = 0
+        self._dragging = False
+        self._drag_origin = (0, 0)
+        self._pan_origin = (0, 0)
+
+        self._configure_view()
+
+    def _configure_view(self):
+        nodes = list(self.env.graph.nodes())
+        xs = [node[0] for node in nodes]
+        ys = [node[1] for node in nodes]
+        self._min_x = min(xs)
+        self._min_y = min(ys)
+        span_x = max(xs) - self._min_x + 1
+        span_y = max(ys) - self._min_y + 1
+        draw_w = GRID_COLS * CELL_SIZE
+        draw_h = GRID_ROWS * CELL_SIZE
+        self._fit_cell_size = max(1.5, min(CELL_SIZE, draw_w / span_x, draw_h / span_y))
+        self._cell_size = self._fit_cell_size
+        self._zoom = 1.0
+        self._pan_x = 0
+        self._pan_y = 0
+        self._node_radius = max(2, min(8, int(self._cell_size * 0.35)))
+        self._port_size = max(4, min(28, int(self._cell_size * 1.2)))
+        self._agent_radius = max(4, min(18, int(self._cell_size * 0.8)))
+        self._agent_offset = max(4, min(18, int(self._cell_size * 0.8)))
+
+    def _set_zoom(self, zoom, anchor=None):
+        old_cell = self._cell_size
+        old_zoom = self._zoom
+        self._zoom = max(0.5, min(16.0, zoom))
+        self._cell_size = self._fit_cell_size * self._zoom
+
+        if anchor is not None and old_zoom != self._zoom:
+            ax, ay = anchor
+            map_x = (ax - MARGIN - self._pan_x) / old_cell + self._min_x
+            map_y = (ay - MARGIN - self._pan_y) / old_cell + self._min_y
+            self._pan_x = ax - MARGIN - (map_x - self._min_x) * self._cell_size
+            self._pan_y = ay - MARGIN - (map_y - self._min_y) * self._cell_size
+
+        self._node_radius = max(2, min(8, int(self._cell_size * 0.35)))
+        self._port_size = max(4, min(28, int(self._cell_size * 1.2)))
+        self._agent_radius = max(4, min(18, int(self._cell_size * 0.8)))
+        self._agent_offset = max(4, min(18, int(self._cell_size * 0.8)))
+
+    def _reset_view(self):
+        self._pan_x = 0
+        self._pan_y = 0
+        self._set_zoom(1.0)
+
+    def _grid_to_px(self, x: int, y: int) -> tuple:
+        px = MARGIN + self._pan_x + (x - self._min_x) * self._cell_size + self._cell_size / 2
+        py = MARGIN + self._pan_y + (y - self._min_y) * self._cell_size + self._cell_size / 2
+        return int(px), int(py)
 
 
     # 초기화 / 종료
@@ -141,7 +197,7 @@ class OHTVisualizer:
         pygame.init()
         self.screen  = pygame.display.set_mode((WIN_W, WIN_H))
         pygame.display.set_caption(
-            "🏭 MARL OHT Fab  |  SPACE=일시정지  ←→=스텝  R=녹화  ESC=종료"
+            "MARL OHT Fab | wheel=zoom drag=pan +/-=zoom F=fit SPACE=pause R=rec ESC=quit"
         )
         self.clock   = pygame.time.Clock()
         self.font_sm = pygame.font.SysFont("consolas", 13)
@@ -210,36 +266,24 @@ class OHTVisualizer:
 
         # 재생 중 이벤트 (SPACE, R, ESC만 — ←→는 일시정지 루프에서 처리)
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
+            handled = self._handle_common_event(event, allow_pause=True)
+            if handled == "quit":
                 return False
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    return False
-                elif event.key == pygame.K_SPACE:
-                    self._paused = True
-                    print(f"  ⏸ 일시정지 (Step {self._current_snap.step})")
-                elif event.key == pygame.K_r:
-                    self._recording = not self._recording
-                    print(f"  {'🔴 녹화 시작' if self._recording else '⏹ 녹화 중지'}")
 
         # 일시정지 중: 내부에서 키 입력 대기 (바깥 루프 진행 차단)
         while self._paused:
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
+                handled = self._handle_common_event(event, allow_pause=False)
+                if handled == "quit":
                     return False
                 if event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        return False
-                    elif event.key == pygame.K_SPACE:
+                    if event.key == pygame.K_SPACE:
                         self._paused = False
                         print("  ▶ 재개")
                     elif event.key == pygame.K_RIGHT:
                         self._snap_idx = min(self._snap_idx + 1, len(self._snapshots) - 1)
                     elif event.key == pygame.K_LEFT:
                         self._snap_idx = max(self._snap_idx - 1, 0)
-                    elif event.key == pygame.K_r:
-                        self._recording = not self._recording
-                        print(f"  {'🔴 녹화 시작' if self._recording else '⏹ 녹화 중지'}")
             self._draw_frame(paused=True)
             pygame.display.flip()
             self.clock.tick(30)
@@ -262,6 +306,55 @@ class OHTVisualizer:
         self.clock.tick(self.fps)
         return True
 
+    def wait_until_closed(self):
+        """Keep the last rendered frame open for inspection."""
+        if self._snap_idx < 0:
+            return
+        print("  Episode ended. Inspect the final frame, then press ESC or close the window.")
+        while True:
+            for event in pygame.event.get():
+                handled = self._handle_common_event(event, allow_pause=False)
+                if handled == "quit":
+                    return
+            self._draw_frame(paused=False)
+            pygame.display.flip()
+            self.clock.tick(30)
+
+    def _handle_common_event(self, event, allow_pause=True):
+        if event.type == pygame.QUIT:
+            return "quit"
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self._dragging = True
+            self._drag_origin = event.pos
+            self._pan_origin = (self._pan_x, self._pan_y)
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._dragging = False
+        elif event.type == pygame.MOUSEMOTION and self._dragging:
+            dx = event.pos[0] - self._drag_origin[0]
+            dy = event.pos[1] - self._drag_origin[1]
+            self._pan_x = self._pan_origin[0] + dx
+            self._pan_y = self._pan_origin[1] + dy
+        elif event.type == pygame.MOUSEWHEEL:
+            anchor = pygame.mouse.get_pos()
+            factor = 1.15 if event.y > 0 else 1 / 1.15
+            self._set_zoom(self._zoom * factor, anchor=anchor)
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                return "quit"
+            if allow_pause and event.key == pygame.K_SPACE:
+                self._paused = True
+                print(f"  pause (Step {self._current_snap.step})")
+            elif event.key in (pygame.K_EQUALS, pygame.K_PLUS):
+                self._set_zoom(self._zoom * 1.15, anchor=(WIN_W // 2, WIN_H // 2))
+            elif event.key in (pygame.K_MINUS, pygame.K_UNDERSCORE):
+                self._set_zoom(self._zoom / 1.15, anchor=(WIN_W // 2, WIN_H // 2))
+            elif event.key == pygame.K_f:
+                self._reset_view()
+            elif event.key == pygame.K_r:
+                self._recording = not self._recording
+                print(f"  {'REC start' if self._recording else 'REC stop'}")
+        return None
+
     # 내부 드로잉
     @property
     def _current_snap(self) -> FrameSnapshot:
@@ -282,16 +375,16 @@ class OHTVisualizer:
         for u, v, data in self.env.graph.edges(data=True):
             edge_type = data.get("edge_type", "bay")
             color = C_RAIL_SPINE if edge_type == "spine" else C_RAIL_BAY
-            width = 4 if edge_type == "spine" else 2
-            x1, y1 = grid_to_px(*u)
-            x2, y2 = grid_to_px(*v)
+            width = max(1, min(4 if edge_type == "spine" else 2, int(self._cell_size / 3)))
+            x1, y1 = self._grid_to_px(*u)
+            x2, y2 = self._grid_to_px(*v)
             if edge_type == "spine":
                 dx, dy = y2-y1, x1-x2
                 length = math.hypot(dx, dy) or 1
-                ox, oy = int(dx/length*6), int(dy/length*6)
+                ox, oy = int(dx/length*min(6, self._cell_size * 0.25)), int(dy/length*min(6, self._cell_size * 0.25))
                 x1, y1, x2, y2 = x1+ox, y1+oy, x2+ox, y2+oy
             pygame.draw.line(self.screen, color, (x1, y1), (x2, y2), width)
-            self._draw_arrowhead(x1, y1, x2, y2, color)
+            self._draw_arrowhead(x1, y1, x2, y2, color, size=max(3, min(8, int(self._cell_size * 0.45))))
 
     def _draw_arrowhead(self, x1, y1, x2, y2, color, size=8):
         dx, dy = x2-x1, y2-y1
@@ -309,24 +402,26 @@ class OHTVisualizer:
 
     def _draw_nodes(self):
         for node, data in self.env.graph.nodes(data=True):
-            px, py = grid_to_px(*node)
+            px, py = self._grid_to_px(*node)
             if data.get("is_port"):
-                rect = pygame.Rect(px-14, py-14, 28, 28)
+                half = self._port_size // 2
+                rect = pygame.Rect(px-half, py-half, self._port_size, self._port_size)
                 pygame.draw.rect(self.screen, C_PORT, rect, border_radius=4)
                 pygame.draw.rect(self.screen, (200, 160, 0), rect, 2, border_radius=4)
-                lbl = self.font_sm.render(f"{node[0]},{node[1]}", True, (30, 30, 30))
-                self.screen.blit(lbl, (px - lbl.get_width()//2, py - lbl.get_height()//2))
+                if self._cell_size >= 18:
+                    lbl = self.font_sm.render(f"{node[0]},{node[1]}", True, (30, 30, 30))
+                    self.screen.blit(lbl, (px - lbl.get_width()//2, py - lbl.get_height()//2))
             else:
-                pygame.draw.circle(self.screen, C_NODE, (px, py), 8)
-                pygame.draw.circle(self.screen, (90, 90, 120), (px, py), 8, 1)
+                pygame.draw.circle(self.screen, C_NODE, (px, py), self._node_radius)
+                pygame.draw.circle(self.screen, (90, 90, 120), (px, py), self._node_radius, 1)
 
     # ── [3] 충돌 이펙트 ──
 
     def _draw_collision_flash(self):
         for node, remaining in self._flash_nodes.items():
-            px, py  = grid_to_px(*node)
+            px, py  = self._grid_to_px(*node)
             ratio   = remaining / FLASH_DURATION
-            radius  = int(28 + (1 - ratio) * 10)
+            radius  = int(self._agent_radius + 10 + (1 - ratio) * 10)
             alpha   = int(220 * ratio)
             surf    = pygame.Surface((radius*2, radius*2), pygame.SRCALPHA)
             pygame.draw.circle(surf, (255, 50, 50, alpha), (radius, radius), radius)
@@ -342,9 +437,9 @@ class OHTVisualizer:
             return
         max_v = max(self._visit_counts.values()) or 1
         for node, count in self._visit_counts.items():
-            px, py  = grid_to_px(*node)
+            px, py  = self._grid_to_px(*node)
             ratio   = count / max_v
-            radius  = int(12 + ratio * 22)
+            radius  = int(max(3, self._node_radius) + ratio * max(4, self._agent_radius))
             if ratio < 0.5:
                 r = int(40  + ratio * 2 * 180)
                 g = int(100 + ratio * 2 * 80)
@@ -374,11 +469,11 @@ class OHTVisualizer:
             idx   = pos_idx[pos]
             pos_idx[pos] += 1
 
-            px, py = grid_to_px(*pos)
+            px, py = self._grid_to_px(*pos)
             if pos_count[pos] > 1:
                 angle = (2 * math.pi / pos_count[pos]) * idx
-                px   += int(math.cos(angle) * 18)
-                py   += int(math.sin(angle) * 18)
+                px   += int(math.cos(angle) * self._agent_offset)
+                py   += int(math.sin(angle) * self._agent_offset)
 
             base  = self._agent_colors[aid]
             stall = snap.infos.get(aid, {}).get("stall_count", 0)
@@ -387,13 +482,14 @@ class OHTVisualizer:
             if snap.agent_states.get(aid, 0) == 1:
                 base = tuple(int(c * 0.5) for c in base)
 
-            pygame.draw.circle(self.screen, base, (px, py), 18)
-            pygame.draw.circle(self.screen, sc,   (px, py), 18, 3)
+            pygame.draw.circle(self.screen, base, (px, py), self._agent_radius)
+            pygame.draw.circle(self.screen, sc,   (px, py), self._agent_radius, max(1, min(3, self._agent_radius // 3)))
 
-            lbl = self.font_md.render(aid.split("_")[-1], True, (20, 20, 20))
-            self.screen.blit(lbl, (px - lbl.get_width()//2, py - lbl.get_height()//2))
+            if self._agent_radius >= 8:
+                lbl = self.font_md.render(aid.split("_")[-1], True, (20, 20, 20))
+                self.screen.blit(lbl, (px - lbl.get_width()//2, py - lbl.get_height()//2))
 
-            tx, ty = grid_to_px(*snap.agent_targets[aid])
+            tx, ty = self._grid_to_px(*snap.agent_targets[aid])
             self._draw_dashed_line(px, py, tx, ty, sc)
 
     def _draw_dashed_line(self, x1, y1, x2, y2, color, dash=6):
@@ -457,7 +553,7 @@ class OHTVisualizer:
                 st_str, st_col = "MOVING", (100, 220, 100)
 
             self.screen.blit(self.font_sm.render(st_str, True, st_col), (sx+34, y+18))
-            self.screen.blit(self.font_sm.render(f"{pos} → {tgt}", True, C_TEXT_DIM), (sx+12, y+34))
+            self.screen.blit(self.font_sm.render(f"{pos} -> {tgt}", True, C_TEXT_DIM), (sx+12, y+34))
 
             bw = SIDEBAR_WIDTH - 24
             pygame.draw.rect(self.screen, (50, 50, 70), (sx+12, y+50, bw, 6), border_radius=3)
@@ -523,14 +619,14 @@ class OHTVisualizer:
         # [2] 일시정지 표시
         if paused:
             ps = self.font_md.render(
-                f"⏸ PAUSED  ← {self._snap_idx} / {len(self._snapshots)-1} →",
+                f"PAUSED  frame {self._snap_idx} / {len(self._snapshots)-1}",
                 True, (255, 220, 80)
             )
             self.screen.blit(ps, (WIN_W//2 - ps.get_width()//2, by+12))
 
         # [6] 녹화 표시
         if self._recording:
-            rs = self.font_md.render(f"● REC {self._frame_idx}", True, (255, 60, 60))
+            rs = self.font_md.render(f"REC {self._frame_idx}", True, (255, 60, 60))
             self.screen.blit(rs, (WIN_W - rs.get_width() - 10, by+12))
 
 

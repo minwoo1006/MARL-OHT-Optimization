@@ -12,6 +12,11 @@ import os
 import random
 import sys
 
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    os.path.join(os.getcwd(), ".matplotlib_cache"),
+)
+
 import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -52,6 +57,36 @@ CSV_FIELDS = [
     "avg_invalid_action_count",
     "avg_episode_return",
 ]
+
+BEST_DENSITY_SWEEP_CONFIG = {
+    "densities": [20, 30, 40, 50],
+    "episodes": 5,
+    "max_steps": 400,
+    "hot_lot_ratio": 0.3,
+    "terminate_on_collision": 1,
+    "map_width": 300,
+    "map_height": 200,
+    "bay_interval": 10,
+    "bay_depth": 10,
+    "seed": 1234,
+}
+
+
+def env_default(name, default, best_default, use_best_config):
+    if name in os.environ:
+        return os.environ[name]
+    return str(best_default if use_best_config else default)
+
+
+def read_density_map_config(use_best_config):
+    if not use_best_config:
+        return read_map_config()
+    return {
+        "width": int(env_default("OHT_MAP_WIDTH", DEFAULT_MAP_CONFIG["width"], BEST_DENSITY_SWEEP_CONFIG["map_width"], True)),
+        "height": int(env_default("OHT_MAP_HEIGHT", DEFAULT_MAP_CONFIG["height"], BEST_DENSITY_SWEEP_CONFIG["map_height"], True)),
+        "bay_interval": int(env_default("OHT_BAY_INTERVAL", DEFAULT_MAP_CONFIG["bay_interval"], BEST_DENSITY_SWEEP_CONFIG["bay_interval"], True)),
+        "bay_depth": int(env_default("OHT_BAY_DEPTH", DEFAULT_MAP_CONFIG["bay_depth"], BEST_DENSITY_SWEEP_CONFIG["bay_depth"], True)),
+    }
 
 
 def append_csv_row(path, row):
@@ -123,7 +158,18 @@ def make_task_batch(ports, num_ohts, hot_lot_batch_size, rng, dist_fn):
     return tasks
 
 
-def run_episode(policy, num_ohts, max_steps, map_config, reward_config, tasks, algo=None):
+def run_episode(
+    policy,
+    num_ohts,
+    max_steps,
+    map_config,
+    reward_config,
+    tasks,
+    algo=None,
+    visualize=False,
+    visualize_fps=6,
+    keep_visualization_open=False,
+):
     env = OHTFabEnv(
         num_ohts=num_ohts,
         max_steps=max_steps,
@@ -136,29 +182,69 @@ def run_episode(policy, num_ohts, max_steps, map_config, reward_config, tasks, a
     episode_return = 0.0
     steps_to_complete_hot_lots = None
     target_hot_lots = env.hot_lot_assigned_count
+    viz = None
+    end_reason = "max_steps"
 
-    for _ in range(max_steps):
-        if policy == "ppo":
-            action_dict = {
-                agent_id: safe_compute_action(algo, obs[agent_id], env=env, agent_id=agent_id)
-                for agent_id in env.agents
-            }
-        elif policy == "dijkstra":
-            action_dict = {
-                agent_id: dijkstra_agent.get_action(env, agent_id)
-                for agent_id in env.agents
-            }
-        else:
-            raise ValueError(f"Unsupported policy: {policy}")
+    if visualize:
+        from utils.visualization import OHTVisualizer
 
-        obs, rewards, terminations, truncations, infos = env.step(action_dict)
-        episode_return += sum(rewards.values())
+        viz = OHTVisualizer(env, fps=visualize_fps)
+        viz.init()
 
-        if target_hot_lots > 0 and env.hot_lot_delivery_count >= target_hot_lots:
-            steps_to_complete_hot_lots = env.current_step
-            break
-        if not env.agents or all(truncations.values()) or all(terminations.values()):
-            break
+    try:
+        for _ in range(max_steps):
+            if policy == "ppo":
+                action_dict = {
+                    agent_id: safe_compute_action(algo, obs[agent_id], env=env, agent_id=agent_id)
+                    for agent_id in env.agents
+                }
+            elif policy == "dijkstra":
+                action_dict = {
+                    agent_id: dijkstra_agent.get_action(env, agent_id)
+                    for agent_id in env.agents
+                }
+            else:
+                raise ValueError(f"Unsupported policy: {policy}")
+
+            prev_positions = env.agent_positions.copy()
+            obs, rewards, terminations, truncations, infos = env.step(action_dict)
+            episode_return += sum(rewards.values())
+
+            if viz:
+                collision_nodes = viz.detect_collisions(prev_positions, env)
+                viz.push_snapshot(env.current_step, infos, collision_nodes)
+                if not viz.render():
+                    end_reason = "viewer_closed"
+                    break
+
+            if target_hot_lots > 0 and env.hot_lot_delivery_count >= target_hot_lots:
+                steps_to_complete_hot_lots = env.current_step
+                end_reason = "hot_lot_batch_completed"
+                break
+            if all(truncations.values()):
+                end_reason = (
+                    "collision_or_stall_truncation"
+                    if env.collision_count > 0
+                    else "max_steps_or_stall_truncation"
+                )
+                break
+            if all(terminations.values()):
+                end_reason = "terminated"
+                break
+            if not env.agents:
+                end_reason = "no_active_agents"
+                break
+    finally:
+        if viz:
+            print(
+                f"Visualization episode ended at step={env.current_step} "
+                f"reason={end_reason} deliveries={env.delivery_count} "
+                f"hot_lots={env.hot_lot_delivery_count}/{target_hot_lots} "
+                f"collisions={env.collision_count} invalid={env.invalid_action_count}"
+            )
+            if keep_visualization_open and end_reason != "viewer_closed":
+                viz.wait_until_closed()
+            viz.close()
 
     metrics = env.get_episode_metrics()
     return {
@@ -275,13 +361,31 @@ def print_recommendation(rows):
 
 def main():
     configure_ray_storage()
-    map_config = read_map_config()
+    visualize_only = os.environ.get("OHT_DENSITY_VISUALIZE_ONLY", "0") == "1"
+    use_best_config = (
+        os.environ.get("OHT_DENSITY_BEST_CONFIG", "1") == "1"
+        or visualize_only
+    )
+    map_config = read_density_map_config(use_best_config)
     reward_config = read_reward_config()
-    max_steps = int(os.environ.get("OHT_DENSITY_MAX_STEPS", "400"))
-    episodes = int(os.environ.get("OHT_DENSITY_EPISODES", "5"))
-    densities = parse_int_list(os.environ.get("OHT_DENSITY_OHTS"), [20, 30, 40, 50])
-    hot_lot_ratio = float(os.environ.get("OHT_BATCH_HOT_LOT_RATIO", "0.3"))
-    seed = int(os.environ.get("OHT_DENSITY_SEED", "1234"))
+    if use_best_config and "OHT_TERMINATE_ON_COLLISION" not in os.environ:
+        reward_config["terminate_on_collision"] = BEST_DENSITY_SWEEP_CONFIG["terminate_on_collision"]
+
+    max_steps = int(env_default("OHT_DENSITY_MAX_STEPS", 400, BEST_DENSITY_SWEEP_CONFIG["max_steps"], use_best_config))
+    episodes = int(env_default("OHT_DENSITY_EPISODES", 5, BEST_DENSITY_SWEEP_CONFIG["episodes"], use_best_config))
+    densities = parse_int_list(
+        os.environ.get("OHT_DENSITY_OHTS"),
+        BEST_DENSITY_SWEEP_CONFIG["densities"] if use_best_config else [20, 30, 40, 50],
+    )
+    hot_lot_ratio = float(env_default("OHT_BATCH_HOT_LOT_RATIO", 0.3, BEST_DENSITY_SWEEP_CONFIG["hot_lot_ratio"], use_best_config))
+    seed = int(env_default("OHT_DENSITY_SEED", 1234, BEST_DENSITY_SWEEP_CONFIG["seed"], use_best_config))
+    visualize = os.environ.get("OHT_DENSITY_VISUALIZE", "0") == "1" or visualize_only
+    default_visualize_policy = "ppo" if visualize_only else "dijkstra"
+    visualize_policy = os.environ.get("OHT_DENSITY_VISUALIZE_POLICY", default_visualize_policy).lower()
+    default_visualize_ohts = BEST_DENSITY_SWEEP_CONFIG["densities"][-1] if use_best_config else densities[0]
+    visualize_ohts = int(os.environ.get("OHT_DENSITY_VISUALIZE_OHTS", str(default_visualize_ohts)))
+    visualize_episode = int(os.environ.get("OHT_DENSITY_VISUALIZE_EPISODE", "0"))
+    visualize_fps = int(os.environ.get("OHT_DENSITY_VISUALIZE_FPS", "6"))
     checkpoint_path = os.environ.get(
         "OHT_CHECKPOINT_IN",
         os.path.join("checkpoints", "best", "ppo_50oht_collision_safe"),
@@ -295,15 +399,85 @@ def main():
 
     base_env = OHTFabEnv(num_ohts=1, max_steps=max_steps, reward_config=reward_config, **map_config)
     print(f"Map ports={len(base_env.port_nodes)} | densities={densities} | max_steps={max_steps}")
+    if use_best_config:
+        print(
+            "Best density config active: "
+            f"OHTs={densities}, episodes={episodes}, hot_lot_ratio={hot_lot_ratio}, "
+            f"terminate_on_collision={reward_config['terminate_on_collision']}, "
+            f"map={map_config['width']}x{map_config['height']}, "
+            f"bay_interval={map_config['bay_interval']}, bay_depth={map_config['bay_depth']}, "
+            f"seed={seed}"
+        )
+    if visualize:
+        print(
+            "Visualization enabled: "
+            f"policy={visualize_policy}, OHTs={visualize_ohts}, "
+            f"episode={visualize_episode}, fps={visualize_fps}"
+        )
 
-    ray.init(ignore_reinit_error=True, include_dashboard=False)
     env_config = {
         "num_ohts": max(densities),
         "max_steps": max_steps,
         "reward_config": reward_config,
         **map_config,
     }
-    algo = build_ppo(checkpoint_path, env_config)
+
+    needs_ppo = not visualize_only or visualize_policy in ("ppo", "both")
+    algo = None
+    if needs_ppo:
+        ray.init(ignore_reinit_error=True, include_dashboard=False)
+        algo = build_ppo(checkpoint_path, env_config)
+
+    if visualize_only:
+        if visualize_ohts not in densities:
+            raise ValueError(
+                f"OHT_DENSITY_VISUALIZE_OHTS={visualize_ohts} is not in OHT_DENSITY_OHTS={densities}"
+            )
+        if visualize_episode < 0 or visualize_episode >= episodes:
+            raise ValueError(
+                f"OHT_DENSITY_VISUALIZE_EPISODE={visualize_episode} must be between 0 and {episodes - 1}"
+            )
+
+        hot_lot_batch_size = max(1, int(round(visualize_ohts * hot_lot_ratio)))
+        rng = random.Random(seed + visualize_ohts * 1000 + visualize_episode)
+        tasks = make_task_batch(
+            base_env.port_nodes,
+            visualize_ohts,
+            hot_lot_batch_size,
+            rng,
+            base_env._get_shortest_dist,
+        )
+        policies = ["ppo", "dijkstra"] if visualize_policy == "both" else [visualize_policy]
+        rows = []
+        for policy in policies:
+            rows.append(
+                {
+                    **run_episode(
+                        policy=policy,
+                        num_ohts=visualize_ohts,
+                        max_steps=max_steps,
+                        map_config=map_config,
+                        reward_config=reward_config,
+                        tasks=tasks,
+                        algo=algo,
+                        visualize=True,
+                        visualize_fps=visualize_fps,
+                        keep_visualization_open=True,
+                    ),
+                    "policy": policy,
+                    "num_ohts": visualize_ohts,
+                    "episodes": 1,
+                    "hot_lot_batch_size": hot_lot_batch_size,
+                }
+            )
+        print_table([
+            summarize(row["policy"], row["num_ohts"], 1, row["hot_lot_batch_size"], [row])
+            for row in rows
+        ])
+        if algo:
+            algo.stop()
+            ray.shutdown()
+        return
 
     summaries = []
     for num_ohts in densities:
@@ -319,6 +493,12 @@ def main():
                 base_env._get_shortest_dist,
             )
             for policy in policy_rows:
+                should_visualize = (
+                    visualize
+                    and num_ohts == visualize_ohts
+                    and episode_idx == visualize_episode
+                    and (visualize_policy == "both" or visualize_policy == policy)
+                )
                 policy_rows[policy].append(
                     run_episode(
                         policy=policy,
@@ -328,6 +508,9 @@ def main():
                         reward_config=reward_config,
                         tasks=tasks,
                         algo=algo,
+                        visualize=should_visualize,
+                        visualize_fps=visualize_fps,
+                        keep_visualization_open=False,
                     )
                 )
 
@@ -339,8 +522,9 @@ def main():
     print_table(summaries)
     print_recommendation(summaries)
     print(f"Saved density sweep CSV: {csv_path}")
-    algo.stop()
-    ray.shutdown()
+    if algo:
+        algo.stop()
+        ray.shutdown()
 
 
 if __name__ == "__main__":
