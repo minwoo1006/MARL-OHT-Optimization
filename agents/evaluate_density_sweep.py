@@ -71,7 +71,6 @@ BEST_DENSITY_SWEEP_CONFIG = {
     "seed": 1234,
 }
 
-
 def env_default(name, default, best_default, use_best_config):
     if name in os.environ:
         return os.environ[name]
@@ -447,9 +446,9 @@ def main():
             rng,
             base_env._get_shortest_dist,
         )
-        policies = ["ppo", "dijkstra"] if visualize_policy == "both" else [visualize_policy]
+        selected_policies = ["ppo", "dijkstra"] if visualize_policy == "both" else [visualize_policy]
         rows = []
-        for policy in policies:
+        for policy in selected_policies:
             rows.append(
                 {
                     **run_episode(

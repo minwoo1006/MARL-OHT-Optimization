@@ -19,7 +19,6 @@ from ray.rllib.algorithms.ppo import PPOConfig
 from ray.tune.registry import register_env
 
 from agents.train_ppo_rllib import (
-    DEFAULT_MAP_CONFIG,
     EVAL_CSV_FIELDS,
     append_csv_row,
     configure_ray_storage,
@@ -103,12 +102,15 @@ def stop_algorithm(algo, algo_name):
     try:
         algo.stop()
     except Exception as exc:
-        print(f"Warning: {algo_name.upper()} cleanup failed after training/eval: {exc}")
+        print(f"Warning: {algo_name.upper()} cleanup failed after training/eval: {exc}", flush=True)
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     storage_path = configure_ray_storage()
-    print(f"Ray storage path: {storage_path}")
+    print(f"Ray storage path: {storage_path}", flush=True)
 
     algorithms = parse_algorithms(os.environ.get("OHT_ALGORITHMS"))
     stage_name = os.environ.get("OHT_STAGE", "rl_comparison")
@@ -127,12 +129,21 @@ def main():
     num_gpus = float(os.environ.get("OHT_NUM_GPUS", "0"))
     train_batch_size = int(os.environ.get("OHT_TRAIN_BATCH_SIZE", "800"))
     minibatch_size = int(os.environ.get("OHT_MINIBATCH_SIZE", str(min(128, train_batch_size))))
+    if any(algo in {"appo", "impala"} for algo in algorithms) and train_batch_size % 50 != 0:
+        raise ValueError(
+            "APPO/IMPALA require OHT_TRAIN_BATCH_SIZE to be a multiple of 50 "
+            "with the current RLlib rollout settings."
+        )
     num_epochs = int(os.environ.get("OHT_NUM_EPOCHS", "5"))
     lr = float(os.environ.get("OHT_LR", "3e-4"))
     gamma = float(os.environ.get("OHT_GAMMA", "0.99"))
     num_iterations = int(os.environ.get("OHT_NUM_ITERATIONS", "10"))
+    log_interval = max(1, int(os.environ.get("OHT_LOG_INTERVAL", "10")))
     final_eval_ohts = parse_int_list(os.environ.get("OHT_FINAL_EVAL_OHTS"), [train_num_ohts])
     final_eval_episodes = int(os.environ.get("OHT_FINAL_EVAL_EPISODES", "5"))
+    checkpoint_root = os.environ.get("OHT_CHECKPOINT_ROOT")
+    if checkpoint_root:
+        checkpoint_root = os.path.abspath(checkpoint_root)
 
     results_dir = os.path.abspath(os.path.join(os.getcwd(), "results"))
     eval_csv_path = os.path.join(results_dir, "rllib_comparison_eval_log.csv")
@@ -146,9 +157,15 @@ def main():
 
     all_eval_summaries = []
     for algo_name in algorithms:
-        print("=" * 80)
-        print(f"Training {algo_name.upper()} | OHTs={train_num_ohts} | iterations={num_iterations}")
-        print("=" * 80)
+        print("=" * 80, flush=True)
+        print(
+            f"Training {algo_name.upper()} | OHTs={train_num_ohts} | "
+            f"iterations={num_iterations} | max_steps={env_config['max_steps']} | "
+            f"map={map_config['width']}x{map_config['height']} | "
+            f"log_interval={log_interval}",
+            flush=True,
+        )
+        print("=" * 80, flush=True)
 
         algo = build_algorithm(
             algo_name,
@@ -167,11 +184,13 @@ def main():
             result = algo.train()
             env_runners = result.get("env_runners", {})
             episode_return_mean = env_runners.get("episode_return_mean")
-            if iteration == 1 or iteration == num_iterations or iteration % 10 == 0:
+            if iteration == 1 or iteration == num_iterations or iteration % log_interval == 0:
                 print(
                     f"{algo_name.upper()} iter={iteration} | "
                     f"return_mean={episode_return_mean} | "
-                    f"episodes={env_runners.get('num_episodes')}"
+                    f"episodes={env_runners.get('num_episodes')} | "
+                    f"env_steps={env_runners.get('num_env_steps_sampled')}",
+                    flush=True,
                 )
 
         for eval_num_ohts in final_eval_ohts:
@@ -190,6 +209,24 @@ def main():
             summary["stage"] = stage_name
             append_csv_row(eval_csv_path, summary, EVAL_CSV_FIELDS)
             all_eval_summaries.append(summary)
+            print(
+                f"{algo_name.upper()} eval OHTs={eval_num_ohts} | "
+                f"delivery={summary['avg_delivery_count']:.2f} | "
+                f"hot_done={summary['avg_hot_lot_delivery_count']:.2f} | "
+                f"collision={summary['avg_collision_count']:.2f} | "
+                f"return={summary['avg_episode_return']:.2f}",
+                flush=True,
+            )
+
+        if checkpoint_root:
+            checkpoint_dir = os.path.join(checkpoint_root, algo_name)
+            checkpoint_result = algo.save(checkpoint_dir)
+            checkpoint_path = getattr(
+                getattr(checkpoint_result, "checkpoint", None),
+                "path",
+                checkpoint_result,
+            )
+            print(f"Saved {algo_name.upper()} checkpoint: {checkpoint_path}", flush=True)
 
         stop_algorithm(algo, algo_name)
 
@@ -221,7 +258,7 @@ def main():
         baseline_summaries + all_eval_summaries,
         title=f"RLlib Algorithm Comparison: {', '.join(algo.upper() for algo in algorithms)}",
     )
-    print(f"Saved comparison CSV: {eval_csv_path}")
+    print(f"Saved comparison CSV: {eval_csv_path}", flush=True)
 
     ray.shutdown()
 

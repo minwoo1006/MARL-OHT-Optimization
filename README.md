@@ -23,7 +23,7 @@ envs/
 agents/
   train_ppo_rllib.py          PPO training, checkpointing, evaluation helpers
   evaluate_density_sweep.py   PPO vs Dijkstra density sweep and visualization
-  train_rllib_comparison.py   PPO/APPO/IMPALA comparison runner
+  train_rllib_comparison.py   Experimental RLlib algorithm comparison runner
   run_curriculum.py           Curriculum training stages
   dijkstra_baseline.py        Shortest-path baseline policy
 
@@ -40,17 +40,6 @@ checkpoints/
                               Best PPO checkpoint used by density sweep
 ```
 
-## Setup
-
-Python 3.10+ is recommended.
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-If `wandb` is not configured, the project still runs in console logging mode.
 
 ## Quick Start
 
@@ -149,20 +138,6 @@ OHT_CHECKPOINT_OUT=checkpoints/ppo_50oht_run \
 python3 agents/train_ppo_rllib.py
 ```
 
-## Algorithm Comparison
-
-Compare RLlib PPO, APPO, and IMPALA:
-
-```bash
-python3 agents/train_rllib_comparison.py
-```
-
-Select algorithms:
-
-```bash
-OHT_ALGORITHMS=ppo,appo python3 agents/train_rllib_comparison.py
-```
-
 ## Evaluation Meaning
 
 The density sweep runs each OHT density for multiple deterministic task batches.
@@ -191,28 +166,3 @@ Key metrics:
 - `SafeEp`: fraction of collision-free episodes
 - `Return`: average total reward
 
-## Tests
-
-Run tests with pytest:
-
-```bash
-python3 -m pytest -q
-```
-
-Lightweight smoke checks:
-
-```bash
-python3 tests/test_pettingzoo_api.py
-python3 tests/test_rllib_env.py
-python3 tests/test_max_steps.py
-```
-
-## Notes
-
-- `checkpoints/best/ppo_50oht_collision_safe` is intentionally tracked because
-  it is the reference checkpoint for density sweep evaluation and visualization.
-- Experiment outputs such as `results/`, `ray_results/`, `wandb/`, recordings,
-  and cache folders are ignored by git.
-- The environment default map is intentionally small for fast smoke tests. The
-  density sweep explicitly overrides map settings to the 300x200 best-evaluation
-  configuration.
